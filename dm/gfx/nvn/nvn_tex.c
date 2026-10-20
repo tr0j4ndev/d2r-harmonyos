@@ -8,6 +8,7 @@
 //   one GOB = 64 bytes × 8 rows = 512 bytes; the block height (tileH, in GOBs) is picked by 'height×1.5'; levels are accumulated with block alignment.
 // The game's packaged textures (SetPackagedTextureLayout) carry 8 bytes of layout parameters: byte 0 = log2 of the block height (derived by comparing 16 cases from the real game,
 // 4 of which differ from the automatic algorithm); when present it takes precedence.
+#include <stdio.h>
 #include "nvn_tex.h"
 
 typedef struct { uint8_t bpb, bw, bh; } fmt_t;   // 每块字节、块宽、块高（非压缩格式块宽高 = 1） | Bytes per block, block width, block height (for uncompressed formats block width and height = 1)
@@ -82,7 +83,26 @@ static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl,
     return off;
 }
 
+/* 客体偶尔把荒谬宽高喂进来（实测 0x464C457F，一段 ELF 头残留被当成尺寸）：会算出 27 TB，
+ * 游戏随后拿这个值查自己的分配表、查不到就空指针崩（NSO text 0x17417a4）。游戏自己的代码在
+ * 尺寸为 0 时回退到 1280x720（main 0x17413d8），这里做同样的兜底，保证端口返回的尺寸/对齐
+ * 与游戏自己的记账一致（它就是用这个返回值查表）。异常仍大声打出来，不掩盖。
+ * The guest occasionally feeds an absurd width/height (measured 0x464C457F, leftover ELF header bytes
+ * taken as a size): that computes 27 TB, the game looks it up in its own allocation table, misses and
+ * dereferences NULL (NSO text 0x17417a4). The game itself falls back to 1280x720 when the size is zero
+ * (main 0x17413d8); do the same so the size/alignment returned stays consistent with its own bookkeeping
+ * (that return value is its lookup key). The anomaly is still printed loudly. */
 void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
+    nvn_texdesc fix = *d;
+    if (fix.width == 0 || fix.width > 16384u) {
+        fprintf(stderr, "[nvn-tex] WIDTH-OOB %u -> game default 1280\n", fix.width);
+        fix.width = 1280;
+    }
+    if (fix.height == 0 || fix.height > 16384u) {
+        fprintf(stderr, "[nvn-tex] HEIGHT-OOB %u -> game default 720\n", fix.height);
+        fix.height = 720;
+    }
+    d = &fix;
     fmt_t t = fmt_of(d->format);
     unsigned dpl; int layered; uint32_t w, h, z;
     shape(d, &dpl, &layered, &w, &h, &z);

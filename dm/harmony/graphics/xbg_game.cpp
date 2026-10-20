@@ -26,6 +26,7 @@ extern "C" {
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <signal.h>
+#include <ucontext.h>
 #include <cerrno>
 #include <unistd.h>
 #include <dlfcn.h>
@@ -77,6 +78,40 @@ void gfx_drain(){
     ++gfx_drain_calls;gfx_drain_ns+=uint64_t(std::chrono::steady_clock::now().time_since_epoch().count())-t0;
 }
 void gfx_async_stop(){if(!gfx_worker.joinable())return;{std::lock_guard<std::mutex> l(gfx_job_mutex);gfx_stop=true;}gfx_job_cv.notify_all();gfx_worker.join();gfx_stop=false;gfx_async=false;}
+// ---- Queue thread: vkQueueSubmit and presentation (acquire, blit, FIFO present) run in order on
+// their own thread, so translation of the next frame overlaps the driver submit and the swapchain.
+// Jobs are only queued by the thread holding `mutex`; every other VkQueue use drains first.
+// A slot fence is waited on only after its submit job ran (queue_wait_submitted): presentation may
+// block indefinitely while the app is in the background, which must not trip the fence timeout.
+// files/gfx-sync-queue (re-read each PERF window) runs these on the translation thread instead.
+bool queue_async=false;
+std::mutex queue_mutex;std::condition_variable queue_cv,queue_progress_cv;std::deque<std::function<void()>> queue_jobs;bool queue_busy=false,queue_stop=false;std::thread queue_worker;
+// Diagnostics entry points take `mutex` and gfx_drain(); called from the queue thread (via the app
+// present callback) while the translation thread holds `mutex` and waits on the queue, they would deadlock.
+thread_local bool on_queue_worker=false;
+uint64_t queue_issued=0;std::atomic<uint64_t> queue_submitted{0};std::atomic<int> queue_presents{0};std::string queue_sync_marker;
+void queue_worker_loop(){
+    pthread_setname_np(pthread_self(),"xbl-queue");on_queue_worker=true;
+    {void *h=dlopen("libqos.so",RTLD_NOW);auto set=h?reinterpret_cast<int(*)(int)>(dlsym(h,"OH_QoS_SetThreadQoS")):nullptr;if(set)set(5);}
+    for(;;){std::function<void()> job;
+        {std::unique_lock<std::mutex> l(queue_mutex);queue_cv.wait(l,[]{return queue_stop||!queue_jobs.empty();});if(queue_jobs.empty())return;job=std::move(queue_jobs.front());queue_jobs.pop_front();queue_busy=true;}
+        job();
+        {std::lock_guard<std::mutex> l(queue_mutex);queue_busy=false;}queue_progress_cv.notify_all();
+    }
+}
+void queue_run(std::function<void()> job){
+    if(!queue_async){job();return;}
+    {std::lock_guard<std::mutex> l(queue_mutex);queue_jobs.push_back(std::move(job));}queue_cv.notify_one();
+}
+void queue_drain(){
+    if(!queue_worker.joinable())return;
+    std::unique_lock<std::mutex> l(queue_mutex);queue_progress_cv.wait(l,[]{return queue_jobs.empty() && !queue_busy;});
+}
+void queue_wait_submitted(uint64_t seq){
+    if(queue_submitted.load()>=seq)return;
+    std::unique_lock<std::mutex> l(queue_mutex);queue_progress_cv.wait(l,[seq]{return queue_submitted.load()>=seq;});
+}
+void queue_stop_worker(){if(!queue_worker.joinable())return;queue_drain();{std::lock_guard<std::mutex> l(queue_mutex);queue_stop=true;}queue_cv.notify_all();queue_worker.join();queue_stop=false;queue_async=false;}
 char error_text[1024]{};
 bool initialized=false,failed=false;
 VkBool32 sampler_mirror_clamp_enabled=VK_FALSE;
@@ -136,13 +171,32 @@ void provenance_draw(){
     provenance_log("DRAW ordinal=%u frame=%llu submit=%llu",provenance.draws,(unsigned long long)provenance.target,(unsigned long long)stats.submissions.load());
 }
 
-uint64_t timing_clock(){return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());}
+// Tens of thousands of scopes per frame: steady_clock (HongMeng shared-page clock) measured ~20% of the
+// graphics thread, so read the virtual counter directly once a startup probe shows EL0 access is allowed.
+uint64_t counter_ns_mult=0; // (1e9 << 32) / CNTFRQ; 0 = use steady_clock
+volatile sig_atomic_t counter_probe_trapped=0;
+void counter_probe_handler(int,siginfo_t*,void *uc){counter_probe_trapped=1;static_cast<ucontext_t*>(uc)->uc_mcontext.pc+=4;}
+void counter_probe(){
+    if(counter_ns_mult)return;
+    struct sigaction sa{},old{};sa.sa_sigaction=counter_probe_handler;sa.sa_flags=SA_SIGINFO;sigemptyset(&sa.sa_mask);
+    if(sigaction(SIGILL,&sa,&old))return;
+    uint64_t freq=0,value=0;counter_probe_trapped=0;
+    __asm__ volatile("mrs %0, cntfrq_el0":"=r"(freq));__asm__ volatile("mrs %0, cntvct_el0":"=r"(value));
+    sigaction(SIGILL,&old,nullptr);
+    if(!counter_probe_trapped && freq>=1000000 && value)counter_ns_mult=uint64_t((static_cast<unsigned __int128>(1000000000ull)<<32)/freq);
+    xbg_logf("NVN caps timing-clock=%s freq=%llu",counter_ns_mult?"cntvct":"steady_clock",(unsigned long long)freq);
+}
+uint64_t timing_clock(){
+    if(counter_ns_mult){uint64_t v;__asm__ volatile("mrs %0, cntvct_el0":"=r"(v));return uint64_t((static_cast<unsigned __int128>(v)*counter_ns_mult)>>32);}
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 XbgCpuTiming timing(timing_clock);
 thread_local XbgCpuTiming *timing_current=nullptr;
 uint64_t timing_first=0,timing_last=0,timing_start_ns=0;
 xbg_game_stats timing_before{};
 bool timing_active=false;
 bool perf_timing=true; // always-on wall-time breakdown for NVN PERF (exclusive deltas)
+std::string perf_parts_marker; // files/gfx-no-perf-parts
 XbgCpuTiming::Counter perf_timing_before[XbgCpuTiming::Count];
 bool descriptor_detail=false;
 XbgDescriptorTiming descriptor_timing;
@@ -262,8 +316,12 @@ struct Buffer {
     // A view into an arena chunk. Arena memory lives until the owning frame slot
     // is retired after its fence, so no per-buffer destruction is needed.
     VkBuffer buffer{}; VkDeviceMemory memory{}; VkDeviceSize offset=0; size_t size{}; void *mapped{}; bool coherent=true;
-    void flush(){if(coherent)return;VkMappedMemoryRange r{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};r.memory=memory;r.size=VK_WHOLE_SIZE;VK(vkFlushMappedMemoryRanges(cfg.device,1,&r));}
-    void invalidate(){if(coherent)return;VkMappedMemoryRange r{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};r.memory=memory;r.size=VK_WHOLE_SIZE;VK(vkInvalidateMappedMemoryRanges(cfg.device,1,&r));}
+    // Only this buffer's range: whole-allocation maintenance of a 32 MB cached chunk costs milliseconds. Allocations are
+    // multiples of arena_alignment (>= nonCoherentAtomSize), so the rounded range stays inside the allocation.
+    VkMappedMemoryRange range()const{VkMappedMemoryRange r{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};r.memory=memory;
+        if(!size){r.size=VK_WHOLE_SIZE;return r;}VkDeviceSize a=arena_alignment;r.offset=offset&~(a-1);r.size=((offset+size+a-1)&~(a-1))-r.offset;return r;}
+    void flush(){if(coherent)return;VkMappedMemoryRange r=range();VK(vkFlushMappedMemoryRanges(cfg.device,1,&r));}
+    void invalidate(){if(coherent)return;VkMappedMemoryRange r=range();VK(vkInvalidateMappedMemoryRanges(cfg.device,1,&r));}
 };
 struct Arena {
     std::vector<ArenaChunk> chunks;size_t current=0;bool cached=false;VkDeviceSize used_total=0,peak=0;
@@ -329,10 +387,15 @@ extern bool resolving_pending;
 uint64_t snap_site_bytes[6]={};unsigned snap_site=0; // perf: copied bytes by caller (0 other,1 vertex,2 index,3 storage,4 texel,5 uniform)
 std::unordered_set<uint64_t> storage_pages;uint64_t storage_snap_count=0;
 namespace wtrack{extern uint64_t copied_bytes,dirty_pages,mismatches,fallbacks;}
+unsigned dyn_last_all=0,dyn_last_vary=0;uint64_t dyn_mode_count[4]={},dyn_vary_hist[17]={},dyn_all_hist[17]={},dyn_miss_mode[3]={};
+extern uint64_t own_fills,own_fill_fail,own_allocs,tex_reg_same_serial;void texel_home_invalidate(uint64_t address,uint64_t bytes);extern uint64_t texel_home_bytes,texel_home_copies,texel_home_fail;size_t texel_home_count();bool memo_has_texel=false;unsigned dyn_last_mode=0;uint64_t texel_memo[4]={};extern bool own_enabled;void own_promote(unsigned si);void own_toggle(bool on);std::string own_marker;bool own_nopersist=false,own_nomemo=false;
 extern std::atomic<uint64_t> memo_epoch;extern uint64_t key_diff[14];extern uint64_t memo_bump[5];extern uint64_t xmemo_hits,xmemo_drops;struct PinRef{VkDescriptorSetLayout layout;uint32_t refs;};extern std::unordered_map<VkDescriptorSet,PinRef> memo_pinned[2];
 extern uint64_t desc_memo_hits,desc_memo_misses,desc_memo_why[6],desc_ns[6],noload_passes,img_cache_hits,img_cache_misses,noload_why[8],binds_skipped;
 namespace warm{extern uint64_t hits,creates,create_ns,create_max_ns;extern std::atomic<uint64_t> built,failed,build_ns;void flush();void register_module(VkShaderModule m,const std::string &key);}
-uint64_t cleanup_ns[5]={},writeback_bytes=0; // perf: cleanup phase split
+uint64_t cleanup_ns[6]={},writeback_bytes=0,cleanup_reports=0; // perf: cleanup phase split
+// Readback arenas are read by the CPU (writebacks, query results); uncached host memory reads at ~180 MB/s here.
+// files/gfx-readback-uncached (read once per PERF window) restores the uncached arena for A/B.
+bool readback_cached=true;std::string readback_marker;bool epoch_gc=true;std::string epoch_gc_marker; // files/gfx-no-epoch-gc
 // Driver/support constant buffers are rebuilt only when their inputs change (iOS: reuse parameter
 // blocks for identical inputs). Generations bump on binding ops; slot_serial on every frame-slot switch.
 uint64_t tex_gen[6]={},buf_gen[6]={},slot_serial=1;
@@ -346,7 +409,7 @@ int ab_period=0;bool ab_on=true;
 bool ab_frame_on=true;
 bool ab_enabled(){if(ab_period<=0)return true;ab_on=((std::chrono::steady_clock::now().time_since_epoch().count()/1000000000ll/ab_period)&1)==0;return ab_on;}
 struct Slot {
-    VkCommandBuffer cmd{};VkFence fence{};VkQueryPool timestamps{};bool recording=false,pending=false;uint64_t ops=0,covers=0; // covers: guest fence value complete once this slot retires
+    VkCommandBuffer cmd{};VkFence fence{};VkQueryPool timestamps{};bool recording=false,pending=false;uint64_t ops=0,covers=0,submit_seq=0; // covers: guest fence value complete once this slot retires
     std::vector<VkQueryPool> occlusion_pools,timestamp_pools;uint32_t occlusion_used=0,timestamp_used=0;
     Retire retire;Arena stream,readback;std::vector<VkDescriptorPool> pools;size_t pool_next=0;
     std::map<std::vector<uint64_t>,VkFramebuffer> framebuffers;
@@ -380,9 +443,23 @@ struct Perf {
 } perf;
 void snapshot_reset();
 void release_descriptors(Slot &s);
+// Diagnostic: the first submissions list their GPU work so a device loss can be tied to one of them.
+unsigned submit_trace_left=16;std::string submit_trace,submit_trace_last;unsigned submit_trace_repeat=0;
+void submit_trace_flush_repeat(){if(submit_trace_repeat>1){char n[16];snprintf(n,sizeof(n),"x%u",submit_trace_repeat);submit_trace+=n;}submit_trace_repeat=0;}
+// files/gfx-op-sync: wait for the GPU before every traced op, so a device loss names the op that caused it.
+bool op_sync=false;unsigned op_sync_count=0;
+void submit_slots(bool wait);
+void submit_trace_op(const std::string &op){
+    if(op_sync && op_sync_count<20000){if(slots[slot_index].recording && slots[slot_index].ops)submit_slots(true);++op_sync_count;xbg_logf("NVN SUBMIT_TRACE opsync n=%u op=%s",op_sync_count,op.c_str());}
+    if(!submit_trace_left || submit_trace.size()>6000)return;
+    if(op==submit_trace_last){++submit_trace_repeat;return;}
+    submit_trace_flush_repeat();submit_trace+=' ';submit_trace+=op;submit_trace_last=op;submit_trace_repeat=1;
+}
 void retire_slot(Slot &s){
     if(!s.pending)return;
-    {CPU_SCOPE(Fence);VK(vkWaitForFences(cfg.device,1,&s.fence,VK_TRUE,std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull)));}
+    {CPU_SCOPE(Fence);queue_wait_submitted(s.submit_seq);VkResult r=vkWaitForFences(cfg.device,1,&s.fence,VK_TRUE,std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull));
+     if(r!=VK_SUCCESS){for(unsigned i=0;i<2;i++)xbg_logf("NVN FENCE_FAIL rc=%d slot=%u pending=%d covers=%llu status=%d",int(r),i,int(slots[i].pending),(unsigned long long)slots[i].covers,slots[i].fence?int(vkGetFenceStatus(cfg.device,slots[i].fence)):99);}
+     VK(r);}
     ++perf.waits;
     if(s.prof){s.prof=false;std::vector<uint64_t> t(s.prof_used,0);
         if(s.prof_used && vkGetQueryPoolResults(cfg.device,s.prof_pool,0,s.prof_used,s.prof_used*8,t.data(),8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS){
@@ -402,7 +479,15 @@ void retire_slot(Slot &s){
      for(size_t i=0;i<s.query_refs.size();i++){auto e=epochs.find(s.query_refs[i].first);if(e==epochs.end())continue;uint64_t a=s.query_refs[i].second;
          if(a>=e->second.base && a<e->second.size()){auto &q=e->second.q[a-e->second.base];q.value=i<used?results[i]:0;q.known=true;}}
      s.query_refs.clear();for(auto &e:epochs)e.second.advance_known();}
-    for(auto &r:pending_reports)if(r.slot==&s && !r.ts_known){uint64_t v=0;if(vkGetQueryPoolResults(cfg.device,r.ts,r.ts_index,1,sizeof(v),&v,sizeof(v),VK_QUERY_RESULT_64_BIT)==VK_SUCCESS)r.ts_value=v;r.ts_known=true;}
+    uint64_t c0b=timing_clock();
+    // One vkGetQueryPoolResults per timestamp pool instead of one per report (each call is slow on this driver).
+    {static std::vector<uint64_t> stamps;static std::vector<uint8_t> stamps_ok;bool any=false;
+     for(auto &r:pending_reports)if(r.slot==&s && !r.ts_known){any=true;break;}
+     if(any){size_t used=s.timestamp_used;stamps.assign(used,0);stamps_ok.assign(s.timestamp_pools.size(),0);
+         for(size_t i=0;i*64<used;i++){uint32_t n=uint32_t(std::min<size_t>(64,used-i*64));stamps_ok[i]=vkGetQueryPoolResults(cfg.device,s.timestamp_pools[i],0,n,n*sizeof(uint64_t),stamps.data()+i*64,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)==VK_SUCCESS;}
+         for(auto &r:pending_reports)if(r.slot==&s && !r.ts_known){
+             for(size_t i=0;i<s.timestamp_pools.size();i++)if(s.timestamp_pools[i]==r.ts){size_t at=i*64+r.ts_index;if(stamps_ok[i] && at<used)r.ts_value=stamps[at];break;}
+             r.ts_known=true;++cleanup_reports;}}}
     s.occlusion_used=0;s.timestamp_used=0;uint64_t c1=timing_clock();
     if(!resolving_pending){resolve_slot_writebacks(&s);resolve_known_reports();
         bool waiting=false;for(auto &r:pending_reports)if(r.slot==&s)waiting=true;if(!waiting)completed=std::max(completed.load(),s.covers);}
@@ -414,7 +499,7 @@ void retire_slot(Slot &s){
     s.stream.reset();s.readback.reset();
     // Every set is fully rewritten before use, so sets are recycled instead of resetting pools (vkAllocateDescriptorSets cost ~15 us/set on Maleoon).
     for(auto &u:s.used_sets){auto &sp=s.spare_sets[u.first];sp.insert(sp.end(),u.second.begin(),u.second.end());u.second.clear();}s.set_cache.clear();
-    cleanup_ns[0]+=c1-c0;cleanup_ns[1]+=c2-c1;cleanup_ns[2]+=c3-c2;cleanup_ns[3]+=c4-c3;cleanup_ns[4]+=timing_clock()-c4;
+    cleanup_ns[0]+=c0b-c0;cleanup_ns[5]+=c1-c0b;cleanup_ns[1]+=c2-c1;cleanup_ns[2]+=c3-c2;cleanup_ns[3]+=c4-c3;cleanup_ns[4]+=timing_clock()-c4;
     s.pending=false;
 }
 Slot &recording_slot(){
@@ -424,12 +509,13 @@ Slot &recording_slot(){
         // Pending writebacks still read this slot's readback arena; finish them before trimming.
         for(auto &w:pending_writebacks)if(w.slot==&s){++perf.why_slot;resolve_pending();break;}
         s.stream.trim();s.readback.keep_chunks=1;s.readback.trim();
+        if(s.readback.cached!=readback_cached){s.readback.release();s.readback.cached=readback_cached;}
         if(!s.cmd){VkCommandBufferAllocateInfo a{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};a.commandPool=command_pool;a.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;a.commandBufferCount=1;VK(vkAllocateCommandBuffers(cfg.device,&a,&s.cmd));}
         if(!s.fence){VkFenceCreateInfo f{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};VK(vkCreateFence(cfg.device,&f,nullptr,&s.fence));}
         if(!s.timestamps && timestamp_bits){VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};q.queryType=VK_QUERY_TYPE_TIMESTAMP;q.queryCount=2;VK(vkCreateQueryPool(cfg.device,&q,nullptr,&s.timestamps));}
         bind_cache_reset();VK(vkResetCommandBuffer(s.cmd,0));VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;VK(vkBeginCommandBuffer(s.cmd,&b));
         if(s.timestamps){vkCmdResetQueryPool(s.cmd,s.timestamps,0,2);vkCmdWriteTimestamp(s.cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,s.timestamps,0);}
-        s.recording=true;s.ops=0;
+        s.recording=true;s.ops=0;own_promote(slot_index);
         if(pass_prof_enabled && stats.presents.load()>=pass_prof_next && timestamp_bits){pass_prof_next=stats.presents.load()+600;
             if(!s.prof_pool){VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};q.queryType=VK_QUERY_TYPE_TIMESTAMP;q.queryCount=1024;VK(vkCreateQueryPool(cfg.device,&q,nullptr,&s.prof_pool));}
             vkCmdResetQueryPool(s.cmd,s.prof_pool,0,1024);s.prof=true;s.prof_used=0;s.prof_recs.clear();s.prof_open=-1;}
@@ -452,8 +538,9 @@ void submit_slots(bool wait){
             s.query_copied=used;}
         if(s.timestamps)vkCmdWriteTimestamp(s.cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,s.timestamps,1);
         VK(vkEndCommandBuffer(s.cmd));
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=1;si.pCommandBuffers=&s.cmd;
-        {CPU_SCOPE(Submit);VK(vkQueueSubmit(cfg.queue,1,&si,s.fence));}
+        {CPU_SCOPE(Submit);const VkCommandBuffer cmd=s.cmd;const VkFence fence=s.fence;const uint64_t seq=s.submit_seq=++queue_issued;
+         queue_run([cmd,fence,seq]{VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=1;si.pCommandBuffers=&cmd;VkResult r=vkQueueSubmit(cfg.queue,1,&si,fence);if(r!=VK_SUCCESS)xbg_fatalf("vkQueueSubmit failed: %d",int(r));queue_submitted.store(seq);});}
+        if(submit_trace_left){--submit_trace_left;submit_trace_flush_repeat();xbg_logf("NVN SUBMIT_TRACE slot=%u covers=%llu ops=%llu:%s",slot_index,(unsigned long long)submitted,(unsigned long long)s.ops,submit_trace.c_str());submit_trace.clear();submit_trace_last.clear();}
         s.recording=false;s.pending=true;s.covers=submitted;slot_index^=1;++perf.submits;snapshot_reset();++slot_serial;
     }
     if(wait){retire_slot(slots[slot_index]);retire_slot(slots[slot_index^1]);}
@@ -483,11 +570,20 @@ void perf_frame(){
     if(pipelines_unsaved && stats.presents.load()>=pipeline_save_frame+300){pipeline_save_frame=stats.presents.load();save_pipeline_cache();}
     uint64_t now=timing_clock();if(!perf.window_start){perf.window_start=now;perf.frames=0;return;}
     if(++perf.frames<60)return;
+    // Re-read once per window so the timing cost can be A/B-measured within one session.
+    const bool window_perf_parts=perf_timing,window_queue=queue_async,window_own=own_enabled;
+    if(!own_marker.empty()){bool want=access(own_marker.c_str(),F_OK)!=0;if(want!=own_enabled)own_toggle(want);
+        bool np=access((own_marker+"-nopersist").c_str(),F_OK)==0,nm=access((own_marker+"-nomemo").c_str(),F_OK)==0;
+        if(np!=own_nopersist||nm!=own_nomemo){own_nopersist=np;own_nomemo=nm;++memo_epoch;}}
+    if(queue_worker.joinable()){bool want=access(queue_sync_marker.c_str(),F_OK)!=0;if(want!=queue_async){queue_drain();queue_async=want;}}
+    if(!perf_parts_marker.empty())perf_timing=access(perf_parts_marker.c_str(),F_OK)!=0;
+    const bool window_rbc=readback_cached;if(!readback_marker.empty())readback_cached=access(readback_marker.c_str(),F_OK)!=0;
+    const bool window_egc=epoch_gc;if(!epoch_gc_marker.empty())epoch_gc=access(epoch_gc_marker.c_str(),F_OK)!=0;
     double wall=double(now-perf.window_start)/1e6,f=double(perf.frames);
-    xbg_logf("NVN PERF v=1 sync=%d frames=%llu wall_ms=%.1f fps=%.2f submit_cpu_ms=%.2f present_cpu_ms=%.2f gpu_ms=%.2f gpu_samples=%llu submits=%.2f waits=%.2f sync_wb=%llu sync_rb=%llu sync_q=%llu ops=%.1f folded=%.1f passes=%.1f draws=%.1f dispatches=%.1f why=w%llu/p%llu/a%llu(%llu,%llu,%llu,%llu,%llu,%llu|%llu,%llu,%llu,%llu)/c%llu/f%llu/s%llu views=%llu snap_hit=%llu snap_miss=%llu snap_mb=%.1f arena_peak_mb=%.1f pipelines=%zu layouts=%zu samplers=%zu passes=%zu images=%zu host_segments=%zu host_mb=%.1f",
+    xbg_logf("NVN PERF v=1 sync=%d frames=%llu wall_ms=%.1f fps=%.2f submit_cpu_ms=%.2f present_cpu_ms=%.2f gpu_ms=%.2f gpu_samples=%llu submits=%.2f waits=%.2f sync_wb=%llu sync_rb=%llu sync_q=%llu ops=%.1f folded=%.1f passes=%.1f draws=%.1f dispatches=%.1f why=w%llu/p%llu/a%llu(%llu,%llu,%llu,%llu,%llu,%llu|%llu,%llu,%llu,%llu)/c%llu/f%llu/s%llu views=%llu snap_hit=%llu snap_miss=%llu snap_mb=%.1f arena_peak_mb=%.1f pipelines=%zu layouts=%zu samplers=%zu passes=%zu images=%zu host_segments=%zu host_mb=%.1f perfparts=%d qasync=%d own=%d ownbisect=%d rbc=%d egc=%d",
         int(sync_mode),(unsigned long long)perf.frames,wall,f*1000.0/wall,double(perf.submit_cpu_ns)/1e6/f,double(perf.present_cpu_ns)/1e6/f,perf.gpu_samples?double(perf.gpu_ns)/1e6/f:-1.0,(unsigned long long)perf.gpu_samples,
         double(perf.submits)/f,double(perf.waits)/f,(unsigned long long)perf.sync_writeback,(unsigned long long)perf.sync_readback,(unsigned long long)perf.sync_query,double(perf.ops)/f,double(perf.folded_clears)/f,double(perf.passes)/f,double(perf.draws)/f,double(perf.dispatches)/f,
-        (unsigned long long)perf.why_wait,(unsigned long long)perf.why_poll,(unsigned long long)perf.why_access,(unsigned long long)perf.access_by[1],(unsigned long long)perf.access_by[2],(unsigned long long)perf.access_by[3],(unsigned long long)perf.access_by[4],(unsigned long long)perf.access_by[5],(unsigned long long)perf.access_by[6],(unsigned long long)perf.access_by[8],(unsigned long long)perf.access_by[9],(unsigned long long)perf.access_by[10],(unsigned long long)perf.access_by[11],(unsigned long long)perf.why_cmdwait,(unsigned long long)perf.why_finish,(unsigned long long)perf.why_slot,(unsigned long long)perf.pending_views,(unsigned long long)perf.snapshot_hits,(unsigned long long)perf.snapshot_misses,double(perf.snapshot_bytes)/1048576.0,double(perf.arena_peak)/1048576.0,perf_counts().pipelines,perf_counts().layouts,perf_counts().samplers,perf_counts().passes,perf_counts().images,perf_counts().host_segments,double(perf_counts().host_bytes)/1048576.0);
+        (unsigned long long)perf.why_wait,(unsigned long long)perf.why_poll,(unsigned long long)perf.why_access,(unsigned long long)perf.access_by[1],(unsigned long long)perf.access_by[2],(unsigned long long)perf.access_by[3],(unsigned long long)perf.access_by[4],(unsigned long long)perf.access_by[5],(unsigned long long)perf.access_by[6],(unsigned long long)perf.access_by[8],(unsigned long long)perf.access_by[9],(unsigned long long)perf.access_by[10],(unsigned long long)perf.access_by[11],(unsigned long long)perf.why_cmdwait,(unsigned long long)perf.why_finish,(unsigned long long)perf.why_slot,(unsigned long long)perf.pending_views,(unsigned long long)perf.snapshot_hits,(unsigned long long)perf.snapshot_misses,double(perf.snapshot_bytes)/1048576.0,double(perf.arena_peak)/1048576.0,perf_counts().pipelines,perf_counts().layouts,perf_counts().samplers,perf_counts().passes,perf_counts().images,perf_counts().host_segments,double(perf_counts().host_bytes)/1048576.0,int(window_perf_parts),int(window_queue),int(window_own),int(own_nopersist)+2*int(own_nomemo),int(window_rbc),int(window_egc));
     if(!timing_active){
         static const char *names[]={"other","draw","dispatch","descriptor","pass","buffer","pipeline","submit","fence","present","cleanup","hash","image","log","program","cpuwrite","snapshot"};
         char line[1024];int at=snprintf(line,sizeof(line),"NVN PERF parts_ms_per_frame");
@@ -499,9 +595,12 @@ void perf_frame(){
     xbg_logf("NVN PERF uniform_trimmed_bindings=%llu snap_mb_per_frame other=%.2f vertex=%.2f index=%.2f storage=%.2f texel=%.2f uniform=%.2f",(unsigned long long)uniform_trimmed,snap_site_bytes[0]/1048576.0/f,snap_site_bytes[1]/1048576.0/f,snap_site_bytes[2]/1048576.0/f,snap_site_bytes[3]/1048576.0/f,snap_site_bytes[4]/1048576.0/f,snap_site_bytes[5]/1048576.0/f);for(auto &b:snap_site_bytes)b=0;
     {static uint64_t pm=0,pe=0;xbg_logf("NVN PERF pipelines_new=%llu evicted=%llu warm_hits=%llu created=%llu create_ms=%.1f create_max_ms=%.1f warm_built=%llu warm_failed=%llu warm_ms=%.0f",(unsigned long long)(pipeline_counts.misses-pm),(unsigned long long)(pipeline_counts.evictions-pe),(unsigned long long)warm::hits,(unsigned long long)warm::creates,warm::create_ns/1e6,warm::create_max_ns/1e6,(unsigned long long)warm::built.load(),(unsigned long long)warm::failed.load(),warm::build_ns.load()/1e6);warm::hits=warm::creates=warm::create_ns=warm::create_max_ns=0;pm=pipeline_counts.misses;pe=pipeline_counts.evictions;}
     xbg_logf("NVN PERF setcache ab=%d hits=%.1f misses=%.1f template=%.1f plain=%.1f memo_hits=%.1f memo_misses=%.1f why=texel%.1f/simg%.1f/sw%.1f/dynbuf%.1f/store%.1f",int(ab_frame_on),set_cache_hits/f,set_cache_misses/f,template_updates/f,plain_updates/f,desc_memo_hits/f,desc_memo_misses/f,desc_memo_why[0]/f,desc_memo_why[1]/f,desc_memo_why[2]/f,desc_memo_why[3]/f,desc_memo_why[4]/f);desc_memo_hits=desc_memo_misses=0;for(auto &w:desc_memo_why)w=0;xbg_logf("NVN PERF keydiff shader%.0f pool%.0f ubo%.0f uaddr%.0f size%.0f vp%.0f alpha%.0f drv%.0f tex%.0f samp%.0f saddr%.0f same%.0f new%.0f len%.0f",key_diff[0]/f,key_diff[1]/f,key_diff[2]/f,key_diff[3]/f,key_diff[4]/f,key_diff[5]/f,key_diff[6]/f,key_diff[7]/f,key_diff[8]/f,key_diff[9]/f,key_diff[10]/f,key_diff[11]/f,key_diff[12]/f,key_diff[13]/f);for(auto &k:key_diff)k=0;
+    {std::string h;char b[48];for(unsigned i=0;i<17;i++)if(dyn_vary_hist[i]||dyn_all_hist[i]){snprintf(b,sizeof b," %u:%.0f/%.0f",i,dyn_vary_hist[i]/f,dyn_all_hist[i]/f);h+=b;}
+     xbg_logf("NVN PERF dynmode lim=%u own=%d m0=%.0f m1=%.0f m2=%.0f m3=%.0f own_fills=%.0f own_fail=%.1f own_allocs=%llu texreg_same_serial=%llu texel_fb=%llu/%llu/%llu/%llu homes=%zu home_mb=%.1f home_copies=%.1f home_fail=%.1f miss=%.0f/%.0f/%.0f m0hist(vary/all)%s",properties.limits.maxDescriptorSetUniformBuffersDynamic,int(own_enabled),dyn_mode_count[0]/f,dyn_mode_count[1]/f,dyn_mode_count[2]/f,dyn_mode_count[3]/f,own_fills/f,own_fill_fail/f,(unsigned long long)own_allocs,(unsigned long long)tex_reg_same_serial,(unsigned long long)texel_memo[0],(unsigned long long)texel_memo[1],(unsigned long long)texel_memo[2],(unsigned long long)texel_memo[3],texel_home_count(),texel_home_bytes/1048576.0,texel_home_copies/f,texel_home_fail/f,dyn_miss_mode[0]/f,dyn_miss_mode[1]/f,dyn_miss_mode[2]/f,h.c_str());
+     for(auto &x:dyn_mode_count)x=0;own_fills=own_fill_fail=0;texel_home_copies=texel_home_fail=0;for(auto &x:dyn_vary_hist)x=0;for(auto &x:dyn_all_hist)x=0;for(auto &x:dyn_miss_mode)x=0;}
     xbg_logf("NVN PERF binds_skipped_per_frame=%.1f xmemo_hits=%.1f drops=%llu bumps=%llu/%llu/%llu/%llu/%llu pinned=%zu/%zu",binds_skipped/f,xmemo_hits/f,(unsigned long long)xmemo_drops,(unsigned long long)memo_bump[0],(unsigned long long)memo_bump[1],(unsigned long long)memo_bump[2],(unsigned long long)memo_bump[3],(unsigned long long)memo_bump[4],memo_pinned[0].size(),memo_pinned[1].size());binds_skipped=0;xmemo_hits=0;xbg_logf("NVN PERF noload_passes_per_frame=%.2f img_cache_hits=%.1f misses=%.1f why=%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f",noload_passes/f,img_cache_hits/f,img_cache_misses/f,noload_why[0]/f,noload_why[1]/f,noload_why[2]/f,noload_why[3]/f,noload_why[4]/f,noload_why[5]/f,noload_why[6]/f,noload_why[7]/f);for(auto &w:noload_why)w=0;noload_passes=0;img_cache_hits=img_cache_misses=0;xbg_logf("NVN PERF desc_ns_per_frame memo_key=%.2f tmpl_update=%.2f alloc=%.2f setkey=%.2f build=%.2f hit_total=%.2f",desc_ns[0]/1e6/f,desc_ns[1]/1e6/f,desc_ns[2]/1e6/f,desc_ns[3]/1e6/f,desc_ns[4]/1e6/f,desc_ns[5]/1e6/f);for(auto &x:desc_ns)x=0;template_updates=plain_updates=0;set_cache_hits=set_cache_misses=0;
     xbg_logf("NVN PERF async=%d drains=%.2f drain_ms=%.2f pace_ms=%.2f waits=%.2f",int(gfx_async),gfx_drain_calls.exchange(0)/f,gfx_drain_ns.exchange(0)/1e6/f,gfx_pace_ns.exchange(0)/1e6/f,gfx_wait_calls.exchange(0)/f);
-    xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
+    xbg_logf("NVN PERF cleanup_ms_per_frame epochs=%zu pending_reports=%zu queries=%.2f/%.2f(reports=%.1f) writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",epochs.size(),pending_reports.size(),cleanup_ns[0]/1e6/f,cleanup_ns[5]/1e6/f,cleanup_reports/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;cleanup_reports=0;
     perf=Perf{};perf.window_start=now;
 }
 void occlusion_query(VkQueryPool &pool,uint32_t &index){
@@ -539,6 +638,7 @@ void snapshot_reset(){snapshots.clear();uniform_snapshots.clear();snapshot_maxle
 void snapshot_invalidate(uint64_t address,uint64_t bytes){
     uint64_t lo=address>snapshot_maxlen?address-snapshot_maxlen:0;
     for(auto *m:{&snapshots,&uniform_snapshots})for(auto it=m->lower_bound({lo,0});it!=m->end() && it->first.first<address+bytes;){uint64_t b=it->first.first,e=b+it->first.second;if(address<e && address+bytes>b)it=m->erase(it);else ++it;}
+    texel_home_invalidate(address,bytes);
 }
 // GPU-resident view of a guest range whose newest content is a pending
 // (not yet written back) GPU result. The producing operation is followed by a
@@ -782,7 +882,11 @@ void capture_image(Image &im,const view_t *view,const char *role){
     }
 }
 std::map<uintptr_t,size_t> pools;
-struct RegisteredTexture{tex_t texture{};view_t view{};bool has_view=false;};
+// version changes whenever the record's contents change. Persistent descriptor memo entries compare it: a texture can
+// be re-registered with a different view or descriptor while keeping its serial and memory.
+struct RegisteredTexture{tex_t texture{};view_t view{};bool has_view=false;uint64_t version=0;};
+uint64_t texture_versions=0,tex_reg_same_serial=0;
+uint64_t texture_version(const tex_t *t){return reinterpret_cast<const RegisteredTexture*>(reinterpret_cast<const char*>(t)-offsetof(RegisteredTexture,texture))->version;}
 using PoolKey=std::pair<uintptr_t,int64_t>;
 PoolKey pool_key(const dpool_t *p){need(p && p->pool,"Missing descriptor pool");return {uintptr_t(p->pool->mem),p->off};}
 std::map<PoolKey,std::map<int,RegisteredTexture>> textures;
@@ -829,7 +933,11 @@ void resolve_known_reports(){
     if(done)pending_reports.erase(pending_reports.begin(),pending_reports.begin()+done);
     // Fold known queries into the running sum up to the earliest count still needed by a pending report, then drop them.
     for(auto &e:epochs){uint64_t limit=e.second.known_upto;for(auto &r:pending_reports)if(r.epoch==e.first)limit=std::min<uint64_t>(limit,r.count);e.second.prefix(limit);e.second.trim();}
-    if(pending_reports.empty())for(auto it=epochs.begin();it!=epochs.end();)if(it->first!=counter_epoch)it=epochs.erase(it);else ++it;
+    // A past epoch matters only to pending reports (new reports use counter_epoch). Reports are pending every frame,
+    // so erasing only when none are pending let one epoch per counter reset accumulate and every walk above grow.
+    if(epoch_gc){for(auto it=epochs.begin();it!=epochs.end();){bool live=it->first==counter_epoch;for(auto &r:pending_reports)if(r.epoch==it->first){live=true;break;}
+            if(live)++it;else it=epochs.erase(it);}}
+    else if(pending_reports.empty())for(auto it=epochs.begin();it!=epochs.end();)if(it->first!=counter_epoch)it=epochs.erase(it);else ++it;
 }
 void resolve_pending(){
     if(resolving_pending || (pending_writebacks.empty() && pending_reports.empty()))return;
@@ -892,7 +1000,7 @@ Image &get_image(const tex_t *t,bool upload){CPU_SCOPE(Image);
     }
     if(it==images.end()){
         need(t->d.samples<=1 || t->d.samples==2 || t->d.samples==4 || t->d.samples==8,"Unsupported texture sample count");
-        need(t->d.target==0 || t->d.target==1 || t->d.target==2 || t->d.target==3 || t->d.target==4 || t->d.target==5 || t->d.target==6 || t->d.target==7 || t->d.target==8 || t->d.target==9,"Unsupported texture target (1D/3D/buffer handled separately)");
+        if(t->d.target<0 || t->d.target>9)xbg_fatalf("Unsupported texture target %d (1D/3D/buffer handled separately) serial=%llu format=%#x size=%dx%dx%d levels=%d flags=%#x mem=%p bytes=%llu",t->d.target,(unsigned long long)t->serial,t->d.format,t->d.width,t->d.height,t->d.depth,t->d.levels,t->d.flags,(void*)t->mem,(unsigned long long)t->L.size);
         auto p=std::make_shared<Image>();p->source=*t;p->provenance_epoch=provenance.epoch((t->mem && t->off>=0 && uint64_t(t->off)<=uint64_t(t->mem)?uint64_t(t->mem)-uint64_t(t->off):0));p->width=t->d.width;p->height=(t->d.target==0 || t->d.target==3)?1:t->d.height;p->depth=t->d.target==2?t->d.depth:1;p->levels=t->d.levels;p->layers=t->L.layers;p->aspects=aspect(t->d.format);p->samples=VkSampleCountFlagBits(std::max(1,t->d.samples));
         need(p->width && p->height && p->levels && p->levels<=16 && p->layers,"Invalid texture dimensions");
         xbg_bc_format info;p->decoded=xbg_bc_format_info(t->d.format,&info)==0;
@@ -959,11 +1067,16 @@ const RegisteredTexture &null_texture(const xbg_shader_binding &b){
     // Original host evidence: main+0x1746820 explicitly binds descriptor 0xFFFFF
     // for unused slots; descriptor 0 is the game's null handle. Only those
     // defined null cases receive zero resources. Missing in-pool IDs still fail.
-    need(b.type!=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && b.type!=VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,"Null writable image descriptor needs robustness2 nullDescriptor support");
+    /* 宿主已启用 VK_EXT_robustness2 的 nullDescriptor，且哑图会带上 STORAGE 用法（见下），
+     * 所以空的可写图像槽不必中止：给它一个哑图，着色器的写入落在哑图上、读取得初值。
+     * The host enables VK_EXT_robustness2 nullDescriptor and the dummy below carries STORAGE usage, so a
+     * null writable image slot does not have to abort: give it a dummy image. */
     uint32_t key=b.flags&0xffffff00u;auto it=null_textures.find(key);if(it!=null_textures.end())return it->second;
     unsigned dim=(b.flags&(1u<<31))?(b.flags>>8)&7:1;bool array=b.flags&(1u<<12);unsigned scalar=(b.flags>>16)&3;
     need(!(b.flags&(1u<<13)),"Null multisample texture descriptor unsupported");
     RegisteredTexture r;tex_t &t=r.texture;t.magic=MAGIC('T','E','X',0);t.serial=nvn_new_serial();t.d.width=t.d.height=t.d.depth=t.d.levels=1;
+    /* 可写图像槽：让哑图带 STORAGE 用法，否则后面的 storage 分支会致命 | writable slot: give the dummy STORAGE usage */
+    if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)t.d.flags|=0x4;
     t.d.format=b.flags&(1u<<14)?0x34:scalar==1?0x2f:scalar==2?0x30:dim==5?0x2e:0x25;
     t.d.target=dim==0?(array?3:0):dim==1?(array?4:1):dim==2?2:dim==3?(array?9:8):dim==5?10:-1;need(t.d.target>=0,"Unknown null texture dimension");
     nvn_tex_layout(&t.d,&t.L);
@@ -1048,13 +1161,34 @@ struct State {
     xbg_depth_bounds bounds{0,0,1};bool count_samples=false;uint64_t samples_passed=0;
 } state;
 void validate_capabilities(const std::vector<uint32_t> &w,uint32_t stage){
+    /* 计算管线创建失败时（实测 rc=-1），需要知道这份 SPIR-V 到底声明了什么能力。
+     * When compute pipeline creation fails (measured rc=-1) we need the capabilities the SPIR-V declares. */
+    if(stage==5){std::string cs;for(size_t i=5;i+1<w.size();){uint32_t op=w[i]&0xffffu,n=w[i]>>16;if(!n)break;if(op==17){char b[16];snprintf(b,sizeof b,"%u ",w[i+1]);cs+=b;}i+=n;}xbg_logf("compute SPIR-V capabilities: %s",cs.c_str());}
     need(w.size()>=5 && w[0]==0x07230203,"Invalid packaged SPIR-V");bool group_operations=false;VkSubgroupFeatureFlags groups=0;
     for(size_t i=5;i<w.size();){uint32_t count=w[i]>>16,op=w[i]&65535;need(count && i+count<=w.size(),"Invalid SPIR-V instruction bounds");if(op>=333 && op<=366)group_operations=true;
-        if(op==17){uint32_t cap=w[i+1];bool ok=true;switch(cap){case 1:case 46:case 47:case 50:break;case 2:ok=cfg.enabled_core.geometryShader;break;case 3:ok=cfg.enabled_core.tessellationShader;break;case 10:ok=cfg.enabled_core.shaderFloat64;break;case 11:ok=cfg.enabled_core.shaderInt64;break;case 22:ok=cfg.enabled_core.shaderInt16;break;case 25:ok=cfg.enabled_core.shaderImageGatherExtended;break;case 32:ok=cfg.enabled_core.shaderClipDistance;break;case 33:ok=cfg.enabled_core.shaderCullDistance;break;case 35:ok=cfg.enabled_core.sampleRateShading;break;case 49:ok=cfg.enabled_core.shaderStorageImageExtendedFormats;break;case 55:ok=cfg.enabled_core.shaderStorageImageReadWithoutFormat;break;case 56:ok=cfg.enabled_core.shaderStorageImageWriteWithoutFormat;break;case 61:groups|=VK_SUBGROUP_FEATURE_BASIC_BIT;break;case 62:groups|=VK_SUBGROUP_FEATURE_VOTE_BIT;break;case 63:groups|=VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;break;case 64:groups|=VK_SUBGROUP_FEATURE_BALLOT_BIT;break;case 65:groups|=VK_SUBGROUP_FEATURE_SHUFFLE_BIT;break;case 66:groups|=VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT;break;case 4427:ok=cfg.enabled_shader_draw_parameters;break;default:xbg_fatalf("Shader stage %u has unhandled capability %u",stage,cap);}if(!ok)xbg_fatalf("Shader stage %u requires disabled capability %u",stage,cap);}
+        if(op==17){uint32_t cap=w[i+1];bool ok=true;switch(cap){case 1:case 46:case 47:case 50:break;case 2:ok=cfg.enabled_core.geometryShader;break;case 3:ok=cfg.enabled_core.tessellationShader;break;case 9:ok=cfg.enabled_shader_float16;break;case 10:ok=cfg.enabled_core.shaderFloat64;break;case 11:ok=cfg.enabled_core.shaderInt64;break;case 22:ok=cfg.enabled_core.shaderInt16;break;case 25:ok=cfg.enabled_core.shaderImageGatherExtended;break;case 32:ok=cfg.enabled_core.shaderClipDistance;break;case 33:ok=cfg.enabled_core.shaderCullDistance;break;case 35:ok=cfg.enabled_core.sampleRateShading;break;case 49:ok=cfg.enabled_core.shaderStorageImageExtendedFormats;break;case 55:ok=cfg.enabled_core.shaderStorageImageReadWithoutFormat;break;case 56:ok=cfg.enabled_core.shaderStorageImageWriteWithoutFormat;break;case 61:groups|=VK_SUBGROUP_FEATURE_BASIC_BIT;break;case 62:groups|=VK_SUBGROUP_FEATURE_VOTE_BIT;break;case 63:groups|=VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;break;case 64:groups|=VK_SUBGROUP_FEATURE_BALLOT_BIT;break;case 65:groups|=VK_SUBGROUP_FEATURE_SHUFFLE_BIT;break;case 66:groups|=VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT;break;case 4427:ok=cfg.enabled_shader_draw_parameters;break;default:xbg_fatalf("Shader stage %u has unhandled capability %u",stage,cap);}if(!ok)xbg_fatalf("Shader stage %u requires disabled capability %u",stage,cap);}
         if(op==10)xbg_fatalf("Shader stage %u declares extension requiring explicit backend support",stage);i+=count;
     }
     need((subgroup.supportedOperations&groups)==groups,"Required subgroup operations unavailable");if(group_operations)need(subgroup.supportedStages&(1u<<stage),"Actual subgroup operation unsupported in shader stage");
 }
+/* 着色器是逐份离线翻译的，每个阶段的绑定号都从 0 开始；同一管线里顶点与片元阶段会撞号
+ * （例如顶点 UBO 和片元纹理都是 binding 1），合并成一个描述符集布局后驱动会把动态偏移错配，
+ * 片元着色器读到顶点阶段的常量，循环次数失控，GPU 挂死。按阶段把绑定号错开。
+ * 管线预热（warm::load_module）必须做同样的平移，否则预热出的管线与布局不符。
+ * Shaders are translated one at a time, so every stage numbers its bindings from 0; the vertex and
+ * fragment stages of one pipeline collide (e.g. vertex UBO and fragment texture both at binding 1).
+ * In the merged set layout the driver then mismatches dynamic offsets, the fragment shader reads the
+ * vertex stage's constants, its loop never ends and the GPU hangs. Give each stage its own range.
+ * Pipeline warm-up (warm::load_module) must apply the same shift or its pipelines mismatch the layout. */
+uint32_t stage_binding_base(uint32_t stage){return stage==5?0:stage*64;}
+/* 预热清单按「键#文件内容哈希」记着色器：着色器库更新后同一个键的绑定 / 输入会变，旧记录配新 SPIR-V
+ * 会造出与布局不符的管线（实测 GPU 复位）。内容对不上的记录直接跳过。
+ * The warm-up list records shaders as "key#content-hash": after a library update the same key can carry
+ * different bindings/inputs, and an old record paired with new SPIR-V builds a pipeline that mismatches its
+ * layout (measured: GPU reset). Records whose content no longer matches are skipped. */
+std::string xgs_identity(const std::string &key,const uint8_t *data,size_t n){uint64_t h=1469598103934665603ull;for(size_t i=0;i<n;i++){h^=data[i];h*=1099511628211ull;}char t[20];snprintf(t,sizeof t,"#%016llx",(unsigned long long)h);return key+t;}
+void offset_spirv_bindings(std::vector<uint32_t> &words,uint32_t stage){const uint32_t base=stage_binding_base(stage);if(!base)return;
+    for(size_t i=5;i<words.size();){uint32_t n=words[i]>>16,op=words[i]&0xffff;if(!n)break;if(op==71 && n>=4 && words[i+2]==33)words[i+3]+=base;i+=n;}}
 Shader *load_shader(const void *control){
     std::string key=control_key(control);auto found=shaders.find(key);if(found!=shaders.end())return found->second.get();
     std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");if(!f)xbg_fatalf("Missing genuine shader bundle %s",path.c_str());
@@ -1063,11 +1197,14 @@ Shader *load_shader(const void *control){
     size_t offset=sizeof(h),expected=offset+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes+h.spirv_bytes;need(expected==bytes.size(),"Shader bundle extent mismatch");
     auto p=std::make_unique<Shader>();p->key=key;p->stage=h.stage;p->bindings.resize(h.binding_count);memcpy(p->bindings.data(),bytes.data()+offset,h.binding_count*sizeof(xbg_shader_binding));offset+=h.binding_count*sizeof(xbg_shader_binding);p->inputs.resize(h.input_count);memcpy(p->inputs.data(),bytes.data()+offset,h.input_count*4);offset+=h.input_count*4;p->c1.assign(bytes.begin()+offset,bytes.begin()+offset+h.c1_bytes);offset+=h.c1_bytes;
     std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);validate_capabilities(words,h.stage);
+    if(const uint32_t base=stage_binding_base(h.stage)){
+        for(auto &b:p->bindings){need(b.binding+b.count<=64,"Shader binding exceeds per-stage range");b.binding+=base;}
+        offset_spirv_bindings(words,h.stage);}
     {auto extent=spirv_uniform_extent(words);uint32_t trimmed=0;for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.source==XBG_SOURCE_UNIFORM){auto e=extent.find(b.binding);uint32_t declared=b.bytes?b.bytes:65536;if(e!=extent.end() && e->second<declared){b.bytes=e->second;++trimmed;}}uniform_trimmed+=trimmed;}
     {bool kill=false;for(size_t i=5;i<words.size();){uint32_t n=words[i]>>16,op=words[i]&0xffff;if(op==252||op==4416||op==5380){kill=true;break;}if(!n)break;i+=n;}p->discards=kill;}
     {bool unknown=false;p->storage_writes=spirv_storage_writes(words,unknown);if(unknown){for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)p->storage_writes.insert(b.binding);}}
     if(h.stage==0){p->input_classes.resize(p->inputs.size());need(xbg_vertex_input_classes(words.data(),words.size(),p->inputs.data(),p->inputs.size(),p->input_classes.data())==0,"Unsupported vertex input scalar interface");}
-    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=h.spirv_bytes;ci.pCode=words.data();VK(vkCreateShaderModule(cfg.device,&ci,nullptr,&p->module));warm::register_module(p->module,key);Shader *out=p.get();shaders.emplace(key,std::move(p));++stats.shader_loads;xbg_logf("NVN shader %s stage=%u loaded",key.c_str(),h.stage);return out;
+    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=h.spirv_bytes;ci.pCode=words.data();VK(vkCreateShaderModule(cfg.device,&ci,nullptr,&p->module));warm::register_module(p->module,xgs_identity(key,bytes.data(),bytes.size()));Shader *out=p.get();shaders.emplace(key,std::move(p));++stats.shader_loads;xbg_logf("NVN shader %s stage=%u loaded",key.c_str(),h.stage);return out;
 }
 // nvnProgramSetShaders assigns a new serial, and NVN shader control/code memory
 // must stay unchanged while a program uses it: cache resolved shaders by serial
@@ -1081,7 +1218,7 @@ const std::array<Shader*,6> &program_shaders(const prog_t *prog){
 }
 } // namespace
 
-extern "C" void xbg_logf(const char *fmt,...){CPU_SCOPE(Log);char text[1024];va_list a;va_start(a,fmt);vsnprintf(text,sizeof(text),fmt,a);va_end(a);if(cfg.log)cfg.log(cfg.userdata,text);else fprintf(stderr,"[xbg] %s\n",text);}
+extern "C" void xbg_logf(const char *fmt,...){CPU_SCOPE(Log);if(cfg.log_wanted && !cfg.log_wanted(cfg.userdata,fmt))return;char text[1024];va_list a;va_start(a,fmt);vsnprintf(text,sizeof(text),fmt,a);va_end(a);if(cfg.log)cfg.log(cfg.userdata,text);else fprintf(stderr,"[xbg] %s\n",text);}
 extern "C" __attribute__((noreturn)) void xbg_fatalf(const char *fmt,...){va_list a;va_start(a,fmt);vsnprintf(error_text,sizeof(error_text),fmt,a);va_end(a);failed=true;xbg_logf("FATAL: %s",error_text);if(cfg.fatal)cfg.fatal(cfg.userdata,error_text);abort();}
 extern "C" int xbg_backend_failed(){return failed;}
 extern "C" const char *xbg_game_last_error(){return error_text;}
@@ -1118,7 +1255,7 @@ extern "C" int xbg_device_integer(int p,int *out){
 
 namespace {
 struct PipelineEntry {VkPipeline pipeline;uint64_t last_used;};
-std::map<std::string,PipelineEntry> pipeline_objects;
+std::unordered_map<std::string,PipelineEntry> pipeline_objects;
 uint64_t pipeline_tick=0;
 constexpr size_t pipeline_object_limit=4096; // field scenes exceed 256 live pipelines; eviction+rebuild caused 100ms+ hitches
 struct PipelineLease {
@@ -1159,15 +1296,18 @@ void record(const VkGraphicsPipelineCreateInfo &ci,const XbgPipelineKey &key){
     put(key.count);pending.insert(pending.end(),bytes.begin(),bytes.end());
 }
 void flush(){if(pending.empty())return;FILE *f=fopen(list_path().c_str(),"ab");if(!f)return;bool ok=fwrite(pending.data(),1,pending.size(),f)==pending.size();ok=fclose(f)==0&&ok;if(ok)pending.clear();}
-VkShaderModule load_module(const std::string &key){
-    {std::lock_guard<std::mutex> l(mu);auto it=modules.find(key);if(it!=modules.end())return it->second;}
+VkShaderModule load_module(const std::string &id){
+    {std::lock_guard<std::mutex> l(mu);auto it=modules.find(id);if(it!=modules.end())return it->second;}
+    size_t hash_at=id.find('#');if(hash_at==std::string::npos)return VK_NULL_HANDLE;const std::string key=id.substr(0,hash_at);
     FILE *f=fopen((std::string(cfg.shader_directory)+"/"+key+".xgs").c_str(),"rb");if(!f)return VK_NULL_HANDLE;
     fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);if(n<32 || n>16*1024*1024){fclose(f);return VK_NULL_HANDLE;}std::vector<uint8_t> b(static_cast<size_t>(n));bool ok=fread(b.data(),1,b.size(),f)==b.size();fclose(f);if(!ok)return VK_NULL_HANDLE;
+    if(xgs_identity(key,b.data(),b.size())!=id)return VK_NULL_HANDLE;
     xbg_shader_header h;memcpy(&h,b.data(),sizeof(h));if(h.magic!=0x31534758 || h.version!=1 || h.spirv_bytes%4)return VK_NULL_HANDLE;
     size_t off=sizeof(h)+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes;if(off+h.spirv_bytes!=b.size())return VK_NULL_HANDLE;
     std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);
+    if(h.stage>=6)return VK_NULL_HANDLE;offset_spirv_bindings(w,h.stage);
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=h.spirv_bytes;ci.pCode=w.data();VkShaderModule m;if(vkCreateShaderModule(cfg.device,&ci,nullptr,&m)!=VK_SUCCESS)return VK_NULL_HANDLE;
-    std::lock_guard<std::mutex> l(mu);auto ins=modules.emplace(key,m);if(!ins.second){vkDestroyShaderModule(cfg.device,m,nullptr);return ins.first->second;}return m;
+    std::lock_guard<std::mutex> l(mu);auto ins=modules.emplace(id,m);if(!ins.second){vkDestroyShaderModule(cfg.device,m,nullptr);return ins.first->second;}return m;
 }
 struct Reader{const uint32_t *w;size_t n,i=0;bool bad=false;uint32_t u(){if(i>=n){bad=true;return 0;}return w[i++];}uint64_t q(){uint64_t lo=u();return lo|(uint64_t(u())<<32);}float f(){uint32_t b=u();float x;memcpy(&x,&b,4);return x;}};
 VkPipelineLayout make_layout(const uint32_t *w,uint32_t n){
@@ -1251,7 +1391,14 @@ void pipeline_lookup(PipelineLease &out,const XbgPipelineKey &key,bool cacheable
     }else ++pipeline_counts.bypass;
     if(graphics && cacheable && warm::take(bytes,out.pipeline)){++warm::hits;}
     else if(graphics){uint64_t t0=timing_clock();VK(vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,graphics,nullptr,&out.pipeline));uint64_t dt=timing_clock()-t0;++warm::creates;warm::create_ns+=dt;warm::create_max_ns=std::max(warm::create_max_ns,dt);if(cacheable)warm::record(*graphics,key);}
-    else VK(vkCreateComputePipelines(cfg.device,pipeline_cache,1,compute,nullptr,&out.pipeline));
+    else {VkResult cr=vkCreateComputePipelines(cfg.device,pipeline_cache,1,compute,nullptr,&out.pipeline);
+        if(cr!=VK_SUCCESS)
+            xbg_fatalf("vkCreateComputePipelines rc=%d module=%p layout=%p entry=%s specEntries=%u specBytes=%zu flags=%u",
+                (int)cr,(void*)compute->stage.module,(void*)compute->layout,
+                compute->stage.pName?compute->stage.pName:"?",
+                compute->stage.pSpecializationInfo?compute->stage.pSpecializationInfo->mapEntryCount:0u,
+                compute->stage.pSpecializationInfo?(size_t)compute->stage.pSpecializationInfo->dataSize:0u,
+                (unsigned)compute->flags);}
     if(!cacheable){out.transient=true;return;}
     if(pipeline_objects.size()==pipeline_object_limit){
         // All prior draws/dispatches waited their fence. This lookup occurs
@@ -1277,6 +1424,7 @@ union DescEntry{VkDescriptorImageInfo image;VkDescriptorBufferInfo buffer;VkBuff
 std::map<std::vector<uint32_t>,LayoutEntry> layout_cache;
 std::map<std::array<const void*,7>,LayoutEntry*> shader_layouts; // shader set -> layout (bindings are immutable per shader)
 std::map<std::array<uint32_t,16>,VkSampler> sampler_cache;
+void own_clear();
 Arena static_arena; // never reset: immutable per-shader c1 constants
 std::map<std::pair<float,float>,Buffer> support_static; // support block per viewport size (contents depend on it only)
 struct SamplerFastKey{std::array<uint32_t,11> w;bool operator==(const SamplerFastKey &o)const{return w==o.w;}};
@@ -1285,7 +1433,7 @@ std::unordered_map<SamplerFastKey,VkSampler,SamplerFastHash> sampler_fast;
 void clear_descriptor_caches(){sampler_fast.clear();
     for(auto &l:layout_cache){if(l.second.tmpl)vkDestroyDescriptorUpdateTemplate(cfg.device,l.second.tmpl,nullptr);vkDestroyPipelineLayout(cfg.device,l.second.pipeline_layout,nullptr);vkDestroyDescriptorSetLayout(cfg.device,l.second.layout,nullptr);}layout_cache.clear();shader_layouts.clear();
     for(auto &x:sampler_cache)vkDestroySampler(cfg.device,x.second,nullptr);sampler_cache.clear();
-    static_arena.release();support_static.clear();
+    static_arena.release();support_static.clear();own_clear();
 }
 VkDescriptorSet allocate_set(VkDescriptorSetLayout layout){
     Slot &s=recording_slot();
@@ -1381,7 +1529,7 @@ struct ImgKey{uint64_t h,sh,tp,to,sp,so,kind;bool operator==(const ImgKey &o)con
 struct ImgKeyHash{size_t operator()(const ImgKey &k)const{uint64_t x=k.h*0x9E3779B97F4A7C15ull^k.sh*0xC2B2AE3D27D4EB4Full^k.tp^(k.to<<17)^(k.sp<<7)^k.so^(k.kind<<40);x^=x>>29;return size_t(x*0xBF58476D1CE4E5B9ull);}};
 struct ImgEntry{const tex_t *tex;Image *im;VkImageView view;VkSampler sampler;};
 std::unordered_map<ImgKey,ImgEntry,ImgKeyHash> img_cache;bool img_cache_enabled=true;uint64_t img_cache_hits=0,img_cache_misses=0;
-struct DescMemo{const LayoutEntry *entry;VkDescriptorSet set;VkPipelineLayout pipeline_layout;std::vector<uint32_t> dynamic_offsets;std::vector<std::pair<const tex_t*,Image*>> images;struct Dyn{uint64_t order;VkBuffer buffer;uint32_t offset;bool uniform;uint8_t src=0,ns=0,bank=0;};std::vector<Dyn> dyn;bool persistent=false;std::vector<std::pair<uint64_t,const void*>> tex_ids;struct Stor{uint64_t base,bytes;VkBuffer buffer;VkDeviceSize offset;};std::vector<Stor> stor;};
+struct DescMemo{const LayoutEntry *entry;VkDescriptorSet set;VkPipelineLayout pipeline_layout;std::vector<uint32_t> dynamic_offsets;std::vector<std::pair<const tex_t*,Image*>> images;struct Dyn{uint64_t order;VkBuffer buffer;uint32_t offset;bool uniform;uint8_t src=0,ns=0,bank=0;};std::vector<Dyn> dyn;bool persistent=false;std::vector<std::pair<uint64_t,const void*>> tex_ids;std::vector<uint64_t> tex_vers;struct Stor{uint64_t base,bytes;VkBuffer buffer;VkDeviceSize offset;};std::vector<Stor> stor;struct Own{uint64_t order;Buffer region;};std::vector<Own> own;struct Texel{uint64_t address,bytes;VkFormat format;VkBufferView view;};std::vector<Texel> texel;};
 struct DynUbo{uint64_t order,address;size_t copy;};
 // Cross-frame memo (Claude C147): the memo lives per frame slot and survives submits. An entry is persistent when its set
 // holds no per-frame snapshot except dynamic uniform buffers (re-snapshotted on every hit, only the offset moves) and the
@@ -1400,16 +1548,79 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute);
 // mode 2 = only the per-draw ones (guest uniform buffers, driver blocks) dynamic, the support block (depends on the viewport
 // only, kept in the static arena) and c1 constants (static) bound at fixed offsets; mode 0 = none dynamic.
 #define UBO_DYN(mode,b) ((b).type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && ((mode)==1 || ((mode)==2 && ((b).source==XBG_SOURCE_UNIFORM||(b).source==XBG_SOURCE_DRIVER0||(b).source==XBG_SOURCE_DRIVER2))))
+// Mode 3 (over the dynamic limit): driver blocks, then guest uniform buffers in binding order, are dynamic while the
+// limit allows; the remaining guest uniform buffers are "owned": static descriptors into a region owned by the memo
+// entry, refreshed from guest memory on every hit. Without it these draws (shaders with 9-12 per-draw uniform
+// buffers) baked per-frame addresses into the memo key and rebuilt every set every frame.
+uint8_t dyn_sel[6][64];
+#define UBO_DYN_AT(mode,st,b) ((mode)==3?dyn_sel[st][size_t(&(b)-state.shader[st]->bindings.data())]!=0:UBO_DYN(mode,b))
+#define UBO_OWN_AT(mode,st,b) ((mode)==3 && (b).type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && (b).source==XBG_SOURCE_UNIFORM && !dyn_sel[st][size_t(&(b)-state.shader[st]->bindings.data())])
+bool own_enabled=true;
 unsigned dyn_mode_for(bool compute,bool *no_ubo=nullptr){unsigned all=0,vary=0;
     for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute)for(auto &b:state.shader[st]->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER){all+=b.count;if(b.source==XBG_SOURCE_UNIFORM||b.source==XBG_SOURCE_DRIVER0||b.source==XBG_SOURCE_DRIVER2)vary+=b.count;}
-    if(no_ubo)*no_ubo=all==0;unsigned lim=properties.limits.maxDescriptorSetUniformBuffersDynamic;
-    return all && all<=lim?1:(vary && vary<=lim && dyn_partial_enabled?2:0);}
-void memo_unpin_all(unsigned si){Slot &s=slots[si];for(auto &pn:memo_pinned[si])s.used_sets[pn.second.layout].push_back(pn.first);memo_pinned[si].clear();desc_memo_slot[si].clear();}
+    if(no_ubo)*no_ubo=all==0;unsigned lim=properties.limits.maxDescriptorSetUniformBuffersDynamic;dyn_last_all=all;dyn_last_vary=vary;
+    if(all && all<=lim)return 1;
+    if(vary && vary<=lim && dyn_partial_enabled)return 2;
+    if(!vary || !dyn_partial_enabled || !own_enabled)return 0;
+    unsigned budget=lim;
+    for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute){auto &bs=state.shader[st]->bindings;if(bs.size()>64)return 0;
+        for(size_t i=0;i<bs.size();i++){auto &b=bs[i];bool drv=b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && (b.source==XBG_SOURCE_DRIVER0||b.source==XBG_SOURCE_DRIVER2);
+            dyn_sel[st][i]=drv && b.count<=budget;if(dyn_sel[st][i])budget-=b.count;else if(drv)return 0;}}
+    for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute){auto &bs=state.shader[st]->bindings;
+        for(size_t i=0;i<bs.size();i++){auto &b=bs[i];if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.source==XBG_SOURCE_UNIFORM && b.count<=budget){dyn_sel[st][i]=1;budget-=b.count;}}}
+    return 3;}
+// Owned regions: persistent memory, recycled per frame slot. A region freed while its slot records may still be read
+// by that recording, so it is reusable only from the slot's next recording (its previous submission has retired).
+Arena own_arena;std::vector<Buffer> own_free[2][9],own_deferred[2][9];uint64_t own_fills=0,own_fill_fail=0,own_allocs=0;
+unsigned own_class(size_t n){unsigned c=0;while((size_t(256)<<c)<n)++c;return c;}
+Buffer own_alloc(size_t n){unsigned c=own_class(n);need(c<9,"Owned uniform region too large");auto &f=own_free[slot_index][c];
+    if(!f.empty()){Buffer b=f.back();f.pop_back();return b;}++own_allocs;return own_arena.alloc(size_t(256)<<c);}
+void own_release(unsigned si,std::vector<DescMemo::Own> &own){for(auto &o:own)own_deferred[si][own_class(o.region.size)].push_back(o.region);own.clear();}
+void own_promote(unsigned si){for(unsigned c=0;c<9;c++){auto &d=own_deferred[si][c];if(d.empty())continue;auto &f=own_free[si][c];f.insert(f.end(),d.begin(),d.end());d.clear();}}
+// Runtime A/B (files/gfx-no-own, read once per PERF window): the mode decides each shader set's layout, so the
+// shader-set -> layout shortcut is dropped; layouts and pipelines of both modes stay cached side by side.
+void own_toggle(bool on){own_enabled=on;shader_layouts.clear();}
+// Texel homes: uniform texel buffers of memoized sets read a per-slot persistent copy of the guest range through a
+// long-lived view, refreshed on the slot's first use in each recording. Stream snapshots and the per-slot view cache are
+// recycled when the slot retires, so a set that outlives its submit must not reference them. A range invalidated after
+// its copy in the same recording (earlier draws may already read that copy) or pending on the GPU falls back to a
+// per-submit snapshot, and the entry stays frame-local.
+struct TexelHome{Buffer buf;uint64_t serial=0;bool stale=false;std::vector<std::pair<VkFormat,VkBufferView>> views;};
+std::map<std::pair<uint64_t,uint64_t>,TexelHome> texel_homes[2];uint64_t texel_home_maxlen=0,texel_home_bytes=0,texel_home_copies=0,texel_home_fail=0;
+constexpr uint64_t texel_home_budget=64ull<<20;
+size_t texel_home_count(){return texel_homes[0].size()+texel_homes[1].size();}
+void texel_home_invalidate(uint64_t address,uint64_t bytes){auto &m=texel_homes[slot_index];if(m.empty())return;
+    uint64_t lo=address>texel_home_maxlen?address-texel_home_maxlen:0;
+    for(auto it=m.lower_bound({lo,0});it!=m.end() && it->first.first<address+bytes;++it){uint64_t b=it->first.first,e=b+it->first.second;
+        if(address<e && address+bytes>b && it->second.serial==slot_serial)it->second.stale=true;}}
+bool texel_home(uint64_t address,uint64_t bytes,VkFormat fmt,VkBufferView &view){
+    {Buffer pv;if(pending_view(address,bytes,properties.limits.minTexelBufferOffsetAlignment,pv)){++texel_home_fail;return false;}}
+    auto &m=texel_homes[slot_index];auto it=m.find({address,bytes});
+    if(it==m.end()){if(texel_home_bytes+bytes>texel_home_budget){++texel_home_fail;return false;}
+        TexelHome h;h.buf=own_arena.alloc(size_t(bytes));texel_home_bytes+=bytes;texel_home_maxlen=std::max(texel_home_maxlen,bytes);it=m.emplace(std::make_pair(address,bytes),h).first;}
+    TexelHome &h=it->second;
+    if(h.serial!=slot_serial){cpu_access(address,bytes,1);memcpy(h.buf.mapped,reinterpret_cast<const void*>(address),size_t(bytes));h.buf.flush();h.serial=slot_serial;h.stale=false;++texel_home_copies;}
+    else if(h.stale){++texel_home_fail;return false;}
+    for(auto &v:h.views)if(v.first==fmt){view=v.second;return true;}
+    VkBufferViewCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};ci.buffer=h.buf.buffer;ci.offset=h.buf.offset;ci.format=fmt;ci.range=bytes;
+    VK(vkCreateBufferView(cfg.device,&ci,nullptr,&view));h.views.push_back({fmt,view});return true;}
+void own_clear(){for(auto &x:own_free)for(auto &v:x)v.clear();for(auto &x:own_deferred)for(auto &v:x)v.clear();
+    for(auto &m:texel_homes){for(auto &h:m)for(auto &v:h.second.views)vkDestroyBufferView(cfg.device,v.second,nullptr);m.clear();}texel_home_bytes=0;texel_home_maxlen=0;
+    own_arena.release();}
+// Same contents and lifetime rules as uniform_snapshot, written into a fixed region. False when the newest data is a
+// pending GPU result (then only a GPU-resident view is correct).
+bool own_fill(Buffer &region,uint64_t address,size_t copy){
+    size_t n=uniform_range(copy);Buffer view;if(pending_view(address,n,properties.limits.minUniformBufferOffsetAlignment,view)){++own_fill_fail;return false;}
+    cpu_access(address,copy,2);need(n<=region.size,"Owned uniform region overflow");memcpy(region.mapped,reinterpret_cast<const void*>(address),copy);
+    if(copy<n)memset(static_cast<uint8_t*>(region.mapped)+copy,0,n-copy);region.flush();++own_fills;return true;}
+std::vector<DescMemo::Own> desc_memo_own;bool desc_memo_own_failed=false;std::vector<DescMemo::Texel> desc_memo_texel;bool desc_memo_texel_failed=false;
+std::unordered_map<std::vector<uint64_t>,uint32_t,SetKeyHash> own_occ; // per submit: occurrence of a base key
+void memo_unpin_all(unsigned si){Slot &s=slots[si];for(auto &e:desc_memo_slot[si])own_release(si,e.second.own);for(auto &pn:memo_pinned[si])s.used_sets[pn.second.layout].push_back(pn.first);memo_pinned[si].clear();desc_memo_slot[si].clear();}
 void memo_check_epoch(){unsigned si=slot_index;if(memo_slot_epoch[si]!=memo_epoch || memo_pinned[si].size()>8192){if(!desc_memo_slot[si].empty())++xmemo_drops;memo_unpin_all(si);memo_slot_epoch[si]=memo_epoch;}}
 // End of a submit for the recording slot: frame-local entries go (their snapshots are per submit); persistent ones stay.
-void desc_memo_reset(){img_cache.clear();
+void desc_memo_reset(){img_cache.clear();own_occ.clear();
     if(!xmemo_enabled){memo_unpin_all(slot_index);return;}
-    auto &m=desc_memo_slot[slot_index];for(auto it=m.begin();it!=m.end();){if(it->second.persistent)++it;else it=m.erase(it);}}
+    auto &m=desc_memo_slot[slot_index];for(auto it=m.begin();it!=m.end();){if(it->second.persistent)++it;else{own_release(slot_index,it->second.own);it=m.erase(it);}}}
 Buffer &support_block(){size_t n=1392;auto k=std::make_pair(state.viewport.width,state.viewport.height);
     auto it=support_static.find(k);if(it!=support_static.end())return it->second;
     Buffer s=static_arena.alloc(uniform_range(n));xbg_support_defaults(s.mapped,state.viewport.width,state.viewport.height);s.flush();return support_static.emplace(k,s).first->second;}
@@ -1421,8 +1632,8 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
     static std::vector<uint64_t> key;key.clear();static std::vector<uint8_t> ktag;ktag.clear();
     bool ok=desc_memo_enabled && !compute && !capture.active && !provenance_file;
     if(ok){CPU_SCOPE(Descriptor);
-        static std::vector<DynUbo> dyn_ubos;dyn_ubos.clear();
-        bool no_ubo=false;const unsigned dmode=dyn_mode_for(false,&no_ubo);memo_dyn_ok=dmode!=0 || no_ubo;
+        static std::vector<DynUbo> dyn_ubos,own_ubos;dyn_ubos.clear();own_ubos.clear();memo_has_texel=false;
+        bool no_ubo=false;const unsigned dmode=dyn_mode_for(false,&no_ubo);dyn_last_mode=dmode;memo_dyn_ok=dmode!=0 || no_ubo;++dyn_mode_count[dmode];if(!dmode && !no_ubo){++dyn_vary_hist[std::min(dyn_last_vary,16u)];++dyn_all_hist[std::min(dyn_last_all,16u)];}
         for(unsigned st=0;st<5;st++){key.push_back(uint64_t(uintptr_t(state.shader[st])));ktag.push_back(0);}
         key.push_back(state.texture_pool.pool?uint64_t(uintptr_t(state.texture_pool.pool->mem)):0);key.push_back(uint64_t(state.texture_pool.off));key.push_back(uint64_t(state.texture_pool.n));ktag.insert(ktag.end(),3,1);
         key.push_back(state.sampler_pool.pool?uint64_t(uintptr_t(state.sampler_pool.pool->mem)):0);key.push_back(uint64_t(state.sampler_pool.off));ktag.insert(ktag.end(),2,1);
@@ -1433,18 +1644,21 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
                 for(unsigned element=0;element<b.count;element++){unsigned slot=b.slot+element;
                     switch(b.source){
                     case XBG_SOURCE_UNIFORM:case XBG_SOURCE_STORAGE:{if(slot>=16){ok=false;break;}auto r=b.source==XBG_SOURCE_UNIFORM?state.ub[ns][slot]:state.sb[ns][slot];
-                        if(UBO_DYN(dmode,b) && b.source==XBG_SOURCE_UNIFORM && r.address && r.size){size_t copy=std::min<size_t>(r.size,b.bytes?b.bytes:65536);key.push_back(copy);ktag.push_back(2);dyn_ubos.push_back({(uint64_t(b.binding)<<32)|element,r.address,copy});} // address only moves the dynamic offset
+                        if((UBO_DYN_AT(dmode,st,b)||UBO_OWN_AT(dmode,st,b)) && b.source==XBG_SOURCE_UNIFORM && r.address && r.size){size_t copy=std::min<size_t>(r.size,b.bytes?b.bytes:65536);key.push_back(copy);ktag.push_back(2);(UBO_DYN_AT(dmode,st,b)?dyn_ubos:own_ubos).push_back({(uint64_t(b.binding)<<32)|element,r.address,copy});} // address only moves the dynamic offset
                         else{key.push_back(r.address);key.push_back(r.size);ktag.push_back(b.source==XBG_SOURCE_UNIFORM?3:10);ktag.push_back(4);}break;}
                     case XBG_SOURCE_SUPPORT:key.push_back((uint64_t(uint32_t(state.viewport.width))<<32)|uint32_t(state.viewport.height));key.push_back(state.color.alpha_func);ktag.push_back(5);ktag.push_back(6);break;
                     case XBG_SOURCE_C1:break;
-                    case XBG_SOURCE_DRIVER0:case XBG_SOURCE_DRIVER2:key.push_back(UBO_DYN(dmode,b)?uint64_t(0xD0D0+b.source):(b.source==XBG_SOURCE_DRIVER0?tex_gen[ns]:buf_gen[ns]));ktag.push_back(7);break; // dynamic: block rebuilt from the current state on every hit (driver_block); otherwise its offset is baked into the set
-                    case XBG_SOURCE_TEXTURE:case XBG_SOURCE_IMAGE:{if(slot>=(b.source==XBG_SOURCE_IMAGE?16u:128u)){ok=false;break;}key.push_back(b.source==XBG_SOURCE_IMAGE?state.img[ns][slot]:state.tex[ns][slot]);ktag.push_back(8);
+                    case XBG_SOURCE_DRIVER0:case XBG_SOURCE_DRIVER2:key.push_back(UBO_DYN_AT(dmode,st,b)?uint64_t(0xD0D0+b.source):(b.source==XBG_SOURCE_DRIVER0?tex_gen[ns]:buf_gen[ns]));ktag.push_back(7);break; // dynamic: block rebuilt from the current state on every hit (driver_block); otherwise its offset is baked into the set
+                    case XBG_SOURCE_TEXTURE:case XBG_SOURCE_IMAGE:{if(slot>=(b.source==XBG_SOURCE_IMAGE?16u:128u)){ok=false;break;}if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER)memo_has_texel=true;key.push_back(b.source==XBG_SOURCE_IMAGE?state.img[ns][slot]:state.tex[ns][slot]);ktag.push_back(8);
                         if(b.sampler_slot!=UINT32_MAX){if(b.sampler_slot>=128){ok=false;break;}key.push_back(state.samp[ns][b.sampler_slot]);ktag.push_back(9);}break;}
                     default:ok=false;}
                     if(!ok)break;
                 }
                 if(!ok)break;
             }}
+        // Owned regions are rewritten on a hit, so an entry may serve one draw per submit: the key carries the occurrence.
+        if(ok && !own_ubos.empty() && own_nomemo)ok=false;
+        if(ok && !own_ubos.empty()){uint32_t &occ=own_occ[key];key.push_back(occ++);ktag.push_back(2);}
         if(ok){memo_check_epoch();auto hit=desc_memo.find(key);
             if(hit==desc_memo.end() && ktag.size()==key.size()){   // diagnostic: which key part differs from the last key of the same shaders
                 static std::unordered_map<std::vector<uint64_t>,std::vector<uint64_t>,SetKeyHash> last;std::vector<uint64_t> pre(key.begin(),key.begin()+5);
@@ -1465,36 +1679,44 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
                 // Persistent entries: every bound texture record must still name the same texture object (serial + memory)
                 // and its image must still be the live one; otherwise only this entry is rebuilt.
                 if(same && m.persistent)for(size_t k=0;k<m.images.size();k++){const tex_t *t=m.images[k].first;
-                    if(t->serial!=m.tex_ids[k].first || t->mem!=m.tex_ids[k].second){same=false;break;}
+                    if(t->serial!=m.tex_ids[k].first || t->mem!=m.tex_ids[k].second || texture_version(t)!=m.tex_vers[k]){same=false;break;}
                     auto li=images.find(t->serial);if(li==images.end() || li->second.get()!=m.images[k].second){same=false;break;}}
                 // Read-only storage ranges: refresh the snapshot (write-tracked resident copies only copy dirty pages); the set
                 // stays valid only if the range lands in the same buffer at the same offset as when the set was written.
                 if(same && m.persistent)for(auto &st:m.stor){snap_site=3;Buffer b=snapshot(st.base,st.bytes,properties.limits.minStorageBufferOffsetAlignment);snap_site=0;
                     if(b.buffer!=st.buffer || b.offset!=st.offset){same=false;break;}}
+                if(same)for(auto &t:m.texel){VkBufferView v=VK_NULL_HANDLE;if(!texel_home(t.address,t.bytes,t.format,v) || v!=t.view){same=false;break;}}
+                if(same && m.own.size()!=own_ubos.size())same=false;
+                if(same && !m.own.empty()){std::sort(own_ubos.begin(),own_ubos.end(),[](const DynUbo &a,const DynUbo &b){return a.order<b.order;});
+                    for(size_t k=0;k<m.own.size();k++)if(m.own[k].order!=own_ubos[k].order || !own_fill(m.own[k].region,own_ubos[k].address,own_ubos[k].copy)){same=false;break;}}
                 if(same){
                 for(auto &ti:m.images){Image *im=ti.second;if(!im->uploaded && !im->gpu_written)im=&get_image(ti.first,true);prepare_read(*im,commands.command);}
                 {size_t elements=0;for(unsigned st=0;st<5;st++)if(state.shader[st])for(auto &b:state.shader[st]->bindings)elements+=b.count;out.buffers.reserve(elements*2+40);} // draw() keeps vertex/index buffers here
                 out.entry=m.entry;out.set=m.set;out.pipeline_layout=m.pipeline_layout;out.dynamic_offsets=offsets;++desc_memo_hits;if(m.persistent)++xmemo_hits;desc_ns[5]+=timing_clock()-tm0;return;}
                 ++desc_memo_why[3];
                 if(m.persistent){auto pin=memo_pinned[slot_index].find(m.set);if(pin!=memo_pinned[slot_index].end() && --pin->second.refs==0){slots[slot_index].used_sets[pin->second.layout].push_back(m.set);memo_pinned[slot_index].erase(pin);}}
-                desc_memo.erase(hit);}}
+                own_release(slot_index,m.own);desc_memo.erase(hit);}}
     }
     desc_ns[0]+=timing_clock()-tm0;
-    desc_memo_images.clear();desc_memo_dyn.clear();desc_memo_recording=ok;
+    desc_memo_images.clear();desc_memo_dyn.clear();desc_memo_own.clear();desc_memo_own_failed=false;desc_memo_texel.clear();desc_memo_texel_failed=false;desc_memo_recording=ok;
     {uint64_t tb=timing_clock();descriptors_build(out,commands,compute);desc_ns[4]+=timing_clock()-tb;}
     desc_memo_recording=false;
     if(ok && !(out.written.empty() && out.buffer_views.empty() && out.set && out.dynamic_offsets.size()==desc_memo_dyn.size()))++desc_memo_why[4];
-    if(ok && out.written.empty() && out.buffer_views.empty() && out.set && out.dynamic_offsets.size()==desc_memo_dyn.size()){++desc_memo_misses;
+    if(ok && !desc_memo_own_failed && out.written.empty() && out.buffer_views.empty() && out.set && out.dynamic_offsets.size()==desc_memo_dyn.size()){++desc_memo_misses;++dyn_miss_mode[memo_dyn_ok?(dyn_last_vary==dyn_last_all?1:2):0];
         std::sort(desc_memo_dyn.begin(),desc_memo_dyn.end(),[](const DescMemo::Dyn &a,const DescMemo::Dyn &b){return a.order<b.order;});
         DescMemo dm{out.entry,out.set,out.pipeline_layout,out.dynamic_offsets,desc_memo_images,desc_memo_dyn};
-        dm.persistent=xmemo_enabled && memo_dyn_ok && out.written.empty();
+        std::sort(desc_memo_own.begin(),desc_memo_own.end(),[](const DescMemo::Own &a,const DescMemo::Own &b){return a.order<b.order;});dm.own=std::move(desc_memo_own);desc_memo_own.clear();
+        dm.texel=desc_memo_texel;
+        if(memo_has_texel && desc_memo_texel_failed)++texel_memo[dyn_last_mode];
+        dm.persistent=xmemo_enabled && memo_dyn_ok && out.written.empty() && !desc_memo_texel_failed && !(own_nopersist && !dm.own.empty());
         for(auto &st:out.storage)dm.stor.push_back({st.first.first,st.first.second,st.second->buffer,st.second->offset});
-        for(auto &ti:dm.images)dm.tex_ids.push_back({ti.first->serial,ti.first->mem});
+        for(auto &ti:dm.images){dm.tex_ids.push_back({ti.first->serial,ti.first->mem});dm.tex_vers.push_back(texture_version(ti.first));}
         for(auto &d:dm.dyn)if(!d.uniform && d.src!=XBG_SOURCE_SUPPORT && d.src!=XBG_SOURCE_DRIVER0 && d.src!=XBG_SOURCE_DRIVER2 && d.src!=XBG_SOURCE_C1)dm.persistent=false;
         if(dm.persistent){unsigned si=slot_index;VkDescriptorSetLayout lay=out.entry->layout;
             auto pin=memo_pinned[si].find(out.set);if(pin!=memo_pinned[si].end())++pin->second.refs;
             else{auto &u=slots[si].used_sets[lay];for(size_t i=0;i<u.size();i++)if(u[i]==out.set){u[i]=u.back();u.pop_back();break;}memo_pinned[si].emplace(out.set,PinRef{lay,1});}}
         desc_memo.emplace(key,std::move(dm));}
+    if(!desc_memo_own.empty())own_release(slot_index,desc_memo_own);
 }
 void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCOPE(Descriptor);DescriptorRoot descriptor_measurement(&cpu_scope);
     // Uniform buffers use dynamic offsets (when the set fits the device limit) so per-draw constants do not change set contents.
@@ -1507,7 +1729,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
     std::array<const void*,7> shader_key{};for(unsigned st=0;st<6;st++)if((st==5)==compute)shader_key[st]=state.shader[st];shader_key[6]=reinterpret_cast<const void*>(uintptr_t(compute));
     for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute)for(auto &b:state.shader[st]->bindings){
         need(b.count && b.count<=128 && b.type<=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,"Unsupported descriptor array/type");
-        key.push_back(b.binding);key.push_back(UBO_DYN(dmode,b)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:b.type);key.push_back(b.count);key.push_back(1u<<st);
+        key.push_back(b.binding);key.push_back(UBO_DYN_AT(dmode,st,b)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:b.type);key.push_back(b.count);key.push_back(1u<<st);
         if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && (b.source==XBG_SOURCE_STORAGE || b.source==XBG_SOURCE_UNIFORM)){bool written=state.shader[st]->storage_writes.count(b.binding)!=0;for(unsigned i=0;i<b.count;i++){
             need(b.slot+i<16,"Storage descriptor slot out of bounds");auto r=b.source==XBG_SOURCE_STORAGE?state.sb[nvn_stage[st]][b.slot+i]:state.ub[nvn_stage[st]][b.slot+i];
             need(r.address && r.size && r.size<=properties.limits.maxStorageBufferRange && r.address+r.size>=r.address,"Invalid storage descriptor address/range");ranges.push_back({r.address,r.address+r.size,written});
@@ -1539,12 +1761,17 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
      buffer_infos.clear();image_infos.clear();texel_views.clear();writes.clear();dynamic_list.clear();buffer_infos.reserve(elements);image_infos.reserve(elements);texel_views.reserve(elements);writes.reserve(elements);}
     for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute){Shader &shader=*state.shader[st];unsigned ns=nvn_stage[st];
         for(auto &b:shader.bindings)for(unsigned element=0;element<b.count;element++){DESC_SCOPE(ElementRest);
-            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};write.dstSet=VK_NULL_HANDLE;write.dstBinding=b.binding;write.dstArrayElement=element;write.descriptorCount=1;write.descriptorType=UBO_DYN(dmode,b)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VkDescriptorType(b.type);
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};write.dstSet=VK_NULL_HANDLE;write.dstBinding=b.binding;write.dstArrayElement=element;write.descriptorCount=1;write.descriptorType=UBO_DYN_AT(dmode,st,b)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VkDescriptorType(b.type);
             if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER){DESC_SCOPE(BufferBind);
                 Buffer *buffer=nullptr;bool is_storage=b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;uint32_t slot=b.slot+element;size_t n=0,buffer_offset=0;const void *data=nullptr;size_t copy=0;
-                if(b.source==XBG_SOURCE_UNIFORM || b.source==XBG_SOURCE_STORAGE){need(slot<16,"Buffer slot out of bounds");auto r=b.source==XBG_SOURCE_UNIFORM?state.ub[ns][slot]:state.sb[ns][slot];need(r.address && r.size,"Required NVN buffer slot is unbound");data=reinterpret_cast<void*>(r.address);copy=r.size;
+                if(b.source==XBG_SOURCE_UNIFORM || b.source==XBG_SOURCE_STORAGE){need(slot<16,"Buffer slot out of bounds");auto r=b.source==XBG_SOURCE_UNIFORM?state.ub[ns][slot]:state.sb[ns][slot];if(!(r.address && r.size)){char d[640];int o=0;o+=snprintf(d+o,sizeof d-(size_t)o,"NVN slot unbound: shader=%s stage=%u nvnStage=%u source=%u slot=%u; bound:",   state.shader[st]?state.shader[st]->key.c_str():"?",st,ns,unsigned(b.source),slot);for(unsigned q=0;q<16 && o<(int)sizeof d-24;q++){auto &e=b.source==XBG_SOURCE_UNIFORM?state.ub[ns][q]:state.sb[ns][q];  if(e.address&&e.size)o+=snprintf(d+o,sizeof d-(size_t)o," %u(%zu)",q,(size_t)e.size);}xbg_fatalf("%s",d);}data=reinterpret_cast<void*>(r.address);copy=r.size;
                     if(is_storage){n=copy;for(auto &v:out.storage)if(r.address>=v.first.first && r.address+r.size<=v.first.first+v.first.second){buffer=v.second;buffer_offset=r.address-v.first.first;break;}need(buffer,"Storage alias allocation not found");need(buffer_offset%properties.limits.minStorageBufferOffsetAlignment==0,"NVN storage offset violates Vulkan alignment");}
-                    else{copy=std::min<size_t>(copy,b.bytes?b.bytes:65536);n=uniform_range(copy);buffer=out.keep(uniform_snapshot(r.address,copy));}
+                    else{copy=std::min<size_t>(copy,b.bytes?b.bytes:65536);n=uniform_range(copy);bool owned=false;
+                        if(desc_memo_recording && UBO_OWN_AT(dmode,st,b)){Buffer region=own_alloc(n);
+                            if(own_fill(region,r.address,copy)){buffer=out.keep(region);desc_memo_own.push_back({(uint64_t(b.binding)<<32)|element,region});owned=true;}
+                            else{own_free[slot_index][own_class(region.size)].push_back(region);desc_memo_own_failed=true;}}
+                        if(!owned)buffer=out.keep(uniform_snapshot(r.address,copy));
+                        if(op_sync){const uint32_t *w=reinterpret_cast<const uint32_t*>(r.address);size_t k=std::min<size_t>(copy/4,8);char hex[128];int o=0;for(size_t i=0;i<k;i++)o+=snprintf(hex+o,sizeof hex-size_t(o)," %08x",w[i]);xbg_logf("NVN SUBMIT_TRACE bindubo shader=%s stage=%u slot=%u size=%zu bytes=%u data=%s",shader.key.c_str(),ns,slot,size_t(r.size),b.bytes,hex);}}
                 }else if(b.source==XBG_SOURCE_SUPPORT){n=1392;need(state.color.alpha_func==8,"Nontrivial NVN alpha test not translated");
                     Buffer &sb=support_block();data=sb.mapped;copy=n;buffer=out.keep(sb);}
                 else if(b.source==XBG_SOURCE_C1){
@@ -1569,7 +1796,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                         ikey={handle,sh,uint64_t(uintptr_t(state.texture_pool.pool->mem)),uint64_t(state.texture_pool.off),state.sampler_pool.pool?uint64_t(uintptr_t(state.sampler_pool.pool->mem)):0,uint64_t(state.sampler_pool.off),uint64_t(b.type)|(uint64_t((b.flags>>16)&3)<<8)};img_cacheable=true;
                         auto it=img_cache.find(ikey);
                         if(it!=img_cache.end()){Image *im=it->second.im;if(!im->uploaded && !im->gpu_written)im=&get_image(it->second.tex,true);
-                            prepare_read(*im,commands.command);if(desc_memo_recording)desc_memo_images.push_back({it->second.tex,im});
+                            prepare_read(*im,commands.command);if(desc_memo_recording)desc_memo_images.push_back({it->second.tex,im});if(op_sync)xbg_logf("NVN SUBMIT_TRACE bindimg-cached shader=%s type=%u img=%ux%ux%u L%u lv%u f%d s%d gpuw=%d upl=%d dec=%d nvnfmt=%#x tgt=%d",shader.key.c_str(),unsigned(b.type),im->width,im->height,im->depth,im->layers,im->levels,int(im->fmt),int(im->samples),int(im->gpu_written),int(im->uploaded),int(im->decoded),it->second.tex->d.format,int(it->second.tex->d.target));
                             VkDescriptorImageInfo ii{};ii.imageView=it->second.view;ii.sampler=b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER?it->second.sampler:VK_NULL_HANDLE;ii.imageLayout=VK_IMAGE_LAYOUT_GENERAL;
                             image_infos.push_back(ii);write.pImageInfo=&image_infos.back();img_fast=true;++img_cache_hits;}
                     }
@@ -1581,16 +1808,19 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                 else{PoolKey pk=pool_key(&state.texture_pool);if(!texture_pool_cache || !(pk==texture_pool_cache_key)){auto pool=textures.find(pk);need(pool!=textures.end(),"Texture descriptor pool not registered");texture_pool_cache=&pool->second;texture_pool_cache_key=pk;}auto tex=texture_pool_cache->find(id);if(tex==texture_pool_cache->end())xbg_fatalf("Unregistered texture descriptor id=%d stage=%u slot=%u",id,ns,slot);record=&tex->second;}
                 const auto &registered=*record;const tex_t &texture=registered.texture;
                 if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){need(texture.d.target==10 && texture.mem && texture.L.size,"Invalid buffer texture");
-                    Buffer *buf=nullptr;uint64_t base=uint64_t(texture.mem),bytes=texture.L.size;
+                    Buffer *buf=nullptr;uint64_t base=uint64_t(texture.mem),bytes=texture.L.size;const VkFormat tf=format(texture.d.format);VkBufferView bv=VK_NULL_HANDLE;
                     if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){Buffer view;if(pending_view(base,bytes,1,view)){buf=out.keep(readback_buffer(bytes));VkCommandBuffer cmd=recording_slot().cmd;end_open_pass();VkBufferCopy region{view.offset,buf->offset,bytes};vkCmdCopyBuffer(cmd,view.buffer,buf->buffer,1,&region);full_barrier(cmd);}else{cpu_access(base,bytes,8);buf=out.keep(readback_buffer(bytes,texture.mem,bytes));}out.storage.push_back({{base,bytes},buf});out.written.push_back({{base,bytes},buf});}
-                    else{snap_site=4;buf=out.keep(snapshot(base,bytes,properties.limits.minTexelBufferOffsetAlignment));snap_site=0;}
-                    VkBufferViewCreateInfo v{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};v.buffer=buf->buffer;v.offset=buf->offset;v.format=format(texture.d.format);v.range=bytes;VkBufferView bv;{auto &cache=recording_slot().texel_views;std::array<uint64_t,4> key{uint64_t(v.buffer),v.offset,v.range,uint64_t(v.format)};auto f=cache.find(key);if(f!=cache.end())bv=f->second;else{VK(vkCreateBufferView(cfg.device,&v,nullptr,&bv));cache.emplace(key,bv);}}texel_views.push_back(bv);write.pTexelBufferView=&texel_views.back();}
-                else{if(aspect(texture.d.format)!=VK_IMAGE_ASPECT_COLOR_BIT){auto prior=images.find(texture.serial);if(prior==images.end() || (!prior->second->uploaded && !prior->second->gpu_written))xbg_logf("NVN initial depth descriptor shader=%s stage=%u slot=%u id=%d serial=%llu format=%#x",shader.key.c_str(),ns,slot,id,(unsigned long long)texture.serial,texture.d.format);}
+                    else if(desc_memo_recording && texel_home(base,bytes,tf,bv))desc_memo_texel.push_back({base,bytes,tf,bv});
+                    else{if(desc_memo_recording)desc_memo_texel_failed=true;snap_site=4;buf=out.keep(snapshot(base,bytes,properties.limits.minTexelBufferOffsetAlignment));snap_site=0;}
+                    if(!bv){VkBufferViewCreateInfo v{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};v.buffer=buf->buffer;v.offset=buf->offset;v.format=tf;v.range=bytes;auto &cache=recording_slot().texel_views;std::array<uint64_t,4> key{uint64_t(v.buffer),v.offset,v.range,uint64_t(v.format)};auto f=cache.find(key);if(f!=cache.end())bv=f->second;else{VK(vkCreateBufferView(cfg.device,&v,nullptr,&bv));cache.emplace(key,bv);}}
+                    texel_views.push_back(bv);write.pTexelBufferView=&texel_views.back();}
+                else{if(texture.d.target<0 || texture.d.target>9)xbg_fatalf("Image binding got texture target %d: shader=%s stage=%u binding=%u type=%u source=%u slot=%u id=%d flags=%#x format=%#x size=%dx%dx%d bytes=%llu",texture.d.target,shader.key.c_str(),ns,b.binding,b.type,b.source,slot,id,b.flags,texture.d.format,texture.d.width,texture.d.height,texture.d.depth,(unsigned long long)texture.L.size);
+                    if(aspect(texture.d.format)!=VK_IMAGE_ASPECT_COLOR_BIT){auto prior=images.find(texture.serial);if(prior==images.end() || (!prior->second->uploaded && !prior->second->gpu_written))xbg_logf("NVN initial depth descriptor shader=%s stage=%u slot=%u id=%d serial=%llu format=%#x",shader.key.c_str(),ns,slot,id,(unsigned long long)texture.serial,texture.d.format);}
                     VkDescriptorImageInfo ii{};
-                    Image &im=get_image(&texture,true);provenance_log("BIND shader=%s stage=%u slot=%u id=%d handle=%llu descriptorMem=%p descriptorOff=%lld type=%u",shader.key.c_str(),ns,slot,id,(unsigned long long)handle,state.texture_pool.pool?state.texture_pool.pool->mem:nullptr,(long long)state.texture_pool.off,unsigned(b.type));provenance_image("BIND",&texture,im,registered.has_view?&registered.view:nullptr);DESC_CALL(ImageTransition, prepare_read(im,commands.command));if(desc_memo_recording)desc_memo_images.push_back({&texture,&im});ii.imageView=DESC_CALL(ImageView, im.view(registered.has_view?&registered.view:nullptr,false,b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));ii.imageLayout=VK_IMAGE_LAYOUT_GENERAL;
+                    Image &im=get_image(&texture,true);if(op_sync)xbg_logf("NVN SUBMIT_TRACE bindimg shader=%s slot=%u type=%u img=%ux%ux%u L%u lv%u f%d s%d gpuw=%d upl=%d dec=%d nvnfmt=%#x tgt=%d view=%d",shader.key.c_str(),slot,unsigned(b.type),im.width,im.height,im.depth,im.layers,im.levels,int(im.fmt),int(im.samples),int(im.gpu_written),int(im.uploaded),int(im.decoded),texture.d.format,int(texture.d.target),int(registered.has_view));if(op_sync&&registered.has_view){const view_t &v=registered.view;xbg_logf("NVN SUBMIT_TRACE bindview set=%u/%u/%u/%u lv=%d+%d layer=%d+%d fmt=%#x tgt=%d",v.set_levels,v.set_layers,v.set_format,v.set_target,v.base_level,v.nlevels,v.min_layer,v.nlayers,v.format,v.target);}provenance_log("BIND shader=%s stage=%u slot=%u id=%d handle=%llu descriptorMem=%p descriptorOff=%lld type=%u",shader.key.c_str(),ns,slot,id,(unsigned long long)handle,state.texture_pool.pool?state.texture_pool.pool->mem:nullptr,(long long)state.texture_pool.off,unsigned(b.type));provenance_image("BIND",&texture,im,registered.has_view?&registered.view:nullptr);DESC_CALL(ImageTransition, prepare_read(im,commands.command));if(desc_memo_recording)desc_memo_images.push_back({&texture,&im});ii.imageView=DESC_CALL(ImageView, im.view(registered.has_view?&registered.view:nullptr,false,b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));ii.imageLayout=VK_IMAGE_LAYOUT_GENERAL;
                     if(capture.active){char label[100];snprintf(label,sizeof(label),"st%u-bind%u-el%u-input",st,b.binding,element);out.capture_inputs.push_back({&im,registered.view,registered.has_view,label});capture_log("TEXTURE label=%s shader=%s nvnStage=%u slot=%u handle=%#llx id=%d serial=%llu cachedSerial=%llu image=%p view=%p viewFormat=%u sourceKind=%u",label,shader.key.c_str(),ns,slot,(unsigned long long)handle,id,(unsigned long long)texture.serial,(unsigned long long)im.source.serial,(void*)im.image,(void*)ii.imageView,unsigned(im.view_format(registered.has_view?&registered.view:nullptr)),b.source);}
                     if(b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b.type==VK_DESCRIPTOR_TYPE_SAMPLER){DESC_SCOPE(SamplerBind);uint64_t sh=handle;if(b.sampler_slot!=UINT32_MAX){need(b.sampler_slot<128,"Sampler slot out of range");sh=state.samp[ns][b.sampler_slot];}int sid=int(sh>>20);samp_par parameters{};if(sid==0){parameters.ws=parameters.wt=parameters.wr=7;parameters.aniso=1;parameters.cmp_func=1;}
-                        else{auto sp=samplers.find(pool_key(&state.sampler_pool));need(sp!=samplers.end(),"Sampler pool not registered");auto sa=sp->second.find(sid);if(sa==sp->second.end())xbg_fatalf("Unregistered sampler id=%d",sid);parameters=sa->second;}ii.sampler=sampler(parameters,im,im.view_format(registered.has_view?&registered.view:nullptr),((b.flags>>16)&3)!=0);if(capture.active)capture_log("SAMPLER st=%u binding=%u sid=%d samplerSlot=%u min=%u mag=%u wrap=%u/%u/%u lod=%g/%g bias=%g",st,b.binding,sid,b.sampler_slot,parameters.minf,parameters.magf,parameters.ws,parameters.wt,parameters.wr,parameters.lod_min,parameters.lod_max,parameters.lod_bias);}
+                        else{auto sp=samplers.find(pool_key(&state.sampler_pool));need(sp!=samplers.end(),"Sampler pool not registered");auto sa=sp->second.find(sid);if(sa==sp->second.end())xbg_fatalf("Unregistered sampler id=%d",sid);parameters=sa->second;}ii.sampler=sampler(parameters,im,im.view_format(registered.has_view?&registered.view:nullptr),((b.flags>>16)&3)!=0);if(op_sync)xbg_logf("NVN SUBMIT_TRACE sampler shader=%s sid=%d min=%u mag=%u wrap=%u/%u/%u lod=%g/%g bias=%g aniso=%g cmp=%u/%u border=%g,%g,%g,%g viewfmt=%d",shader.key.c_str(),sid,parameters.minf,parameters.magf,parameters.ws,parameters.wt,parameters.wr,parameters.lod_min,parameters.lod_max,parameters.lod_bias,parameters.aniso,parameters.cmp_mode,parameters.cmp_func,parameters.border[0],parameters.border[1],parameters.border[2],parameters.border[3],int(im.view_format(registered.has_view?&registered.view:nullptr)));if(capture.active)capture_log("SAMPLER st=%u binding=%u sid=%d samplerSlot=%u min=%u mag=%u wrap=%u/%u/%u lod=%g/%g bias=%g",st,b.binding,sid,b.sampler_slot,parameters.minf,parameters.magf,parameters.ws,parameters.wt,parameters.wr,parameters.lod_min,parameters.lod_max,parameters.lod_bias);}
                     if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE){VkFormat viewed=im.view_format(registered.has_view?&registered.view:nullptr);if(!(im.usage&VK_IMAGE_USAGE_STORAGE_BIT))xbg_fatalf("NVN storage image without IMAGE flag serial=%llu format=%#x flags=%#x",(unsigned long long)texture.serial,texture.d.format,texture.d.flags);const VkFormatProperties &fp=format_properties(viewed);need(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,"Format not usable as storage image");
                         if(b.flags&3){VkFormatProperties3 extra{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};VkFormatProperties2 all{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};all.pNext=&extra;vkGetPhysicalDeviceFormatProperties2(cfg.physical,viewed,&all);if(b.flags&1)need(extra.optimalTilingFeatures&VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT,"Image format lacks formatless-write support");if(b.flags&2)need(extra.optimalTilingFeatures&VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT,"Image format lacks formatless-read support");}im.gpu_written=true,provenance_write(im,__LINE__);im.last_write=++write_seq;}
                     image_infos.push_back(ii);write.pImageInfo=&image_infos.back();
@@ -1740,7 +1970,7 @@ bool overwrites_targets(const Pass &p,int count,const p_draw_idx *indexed,uint32
     for(int i=0;i<state.rt.n;i++)if(state.rt.color[i]){if((state.color.blend_en>>i)&1){++noload_why[6];return false;}if(((state.mask.mask>>(4*i))&15)!=15){++noload_why[7];return false;}}
     return true;
 }
-void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0){CPU_SCOPE(Draw);DrawRoot draw_timing_root(&cpu_scope);provenance_draw();
+void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0){CPU_SCOPE(Draw);DrawRoot draw_timing_root(&cpu_scope);provenance_draw();if(submit_trace_left||op_sync){std::string t="R";for(unsigned i=0;i<5;i++)if(state.shader[i]){t+=char('0'+i);t+=state.shader[i]->key.substr(0,8);}submit_trace_op(t);}
     need(state.rt.n>=0 && state.rt.n<=8,"Invalid draw color target count");
     VkShaderModule modules[5]{};for(unsigned i=0;i<5;i++)if(state.shader[i])modules[i]=state.shader[i]->module;
     uint32_t active_colors=0;for(int i=0;i<state.rt.n;i++)if(state.rt.color[i])active_colors|=1u<<i;
@@ -1796,6 +2026,13 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     {DRAW_SCOPE(VertexPrepare);for(auto &b:bindings){if(int(b.binding)==zero_binding){const uint32_t zero[4]={0};vertex_buffers.push_back({b.binding,d.keep(stream_buffer(sizeof(zero),zero,sizeof(zero)))});continue;}auto r=state.vb[b.binding];need(r.address && r.size,"Unbound vertex buffer");snap_site=1;vertex_buffers.push_back({b.binding,d.keep(snapshot(r.address,r.size))});snap_site=0;}
     if(indexed){need(indexed->itype>=0 && indexed->itype<=2 && indexed->instances>0 && indexed->base_instance>=0,"Invalid indexed draw");size_t bytes=size_t(count)*(1u<<indexed->itype);need(indexed->ibuf,"Unbound index buffer");if(indexed->itype==0){if(draw_detail)draw_timing.index(uint64_t(count));std::vector<uint16_t> expanded(count);const uint8_t *src=reinterpret_cast<const uint8_t*>(indexed->ibuf);for(int i=0;i<count;i++)expanded[i]=src[i];ib=d.keep(stream_buffer(expanded.size()*2,expanded.data(),expanded.size()*2));}else{index_type=indexed->itype==1?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32;snap_site=2;ib=indexed==&quad_indexed?d.keep(stream_buffer(bytes,reinterpret_cast<void*>(indexed->ibuf),bytes)):d.keep(snapshot(uint64_t(indexed->ibuf),bytes));snap_site=0;}}
     } // VertexPrepare excludes capture, recording and storage writeback.
+    if(op_sync){for(int i=0;i<state.rt.n;i++)if(state.rt.color[i])xbg_logf("NVN SUBMIT_TRACE rtview i=%d has=%u lv=%d+%d layer=%d+%d fmt=%#x tgt=%d blend=%u mask=%#x",i,state.rt.has_cview[i],state.rt.cview[i].base_level,state.rt.cview[i].nlevels,state.rt.cview[i].min_layer,state.rt.cview[i].nlayers,state.rt.cview[i].format,state.rt.cview[i].target,unsigned((state.color.blend_en>>i)&1),unsigned((state.mask.mask>>(4*i))&15));}
+    if(op_sync){char line[1000];int n=snprintf(line,sizeof(line),"NVN SUBMIT_TRACE drawinfo prim=%d first=%d count=%d indexed=%d itype=%d inst=%u bv=%d pass=%ux%u s=%d",prim,first,count,indexed!=nullptr,indexed?indexed->itype:-1,indexed?indexed->instances:instances,indexed?indexed->base_vertex:0,p.width,p.height,int(p.samples));
+        for(auto *im:p.images)if(n>0&&size_t(n)<sizeof(line))n+=snprintf(line+n,sizeof(line)-n," rt=%ux%ux%u/L%u/lv%u/f%d/s%d",im->width,im->height,im->depth,im->layers,im->levels,int(im->fmt),int(im->samples));
+        for(auto &v:vertex_buffers)if(n>0&&size_t(n)<sizeof(line))n+=snprintf(line+n,sizeof(line)-n," vb%u=%zu/st%u",v.first,v.second->size,state.stream[v.first<16?v.first:0].stride);
+        for(auto &at:attributes)if(n>0&&size_t(n)<sizeof(line))n+=snprintf(line+n,sizeof(line)-n," at%u=b%u/f%d/o%u",at.location,at.binding,int(at.format),at.offset);
+        if(ib && n>0&&size_t(n)<sizeof(line)){uint32_t mx=0;const uint8_t *m=static_cast<const uint8_t*>(ib->mapped);if(m)for(int i=0;i<count;i++){uint32_t v=index_type==VK_INDEX_TYPE_UINT32?reinterpret_cast<const uint32_t*>(m)[i]:reinterpret_cast<const uint16_t*>(m)[i];mx=std::max(mx,v);}n+=snprintf(line+n,sizeof(line)-n," ib=%zu maxidx=%u",ib->size,mx);}
+        xbg_logf("%s",line);}
     if(capture.active){for(auto &v:vertex_buffers){char label[40];snprintf(label,sizeof(label),"vertex-stream%u",v.first);capture_log("VERTEX label=%s guest=%#llx bytes=%zu",label,(unsigned long long)state.vb[v.first].address,v.second->size);capture_data(label,v.second->mapped,v.second->size);}if(ib){capture_log("INDEX guest=%#llx vkType=%u bytes=%zu",(unsigned long long)indexed->ibuf,unsigned(index_type),ib->size);capture_data("index",ib->mapped,ib->size);}for(auto &input:d.capture_inputs)for(auto *output:p.images)if(input.image==output)capture_log("FEEDBACK input=%s serial=%llu",input.label.c_str(),(unsigned long long)output->source.serial);}
     VkQueryPool occlusion{};uint32_t occlusion_index=0;if(state.count_samples){need(cfg.enabled_core.occlusionQueryPrecise,"Precise samples-passed query disabled");occlusion_query(occlusion,occlusion_index);}
     if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){end_open_pass();if(overwrites_targets(p,count,indexed,instances)){VkRenderPass keep=p.pass;p.pass=p.pass_noload;begin_pass(p,c);p.pass=keep;++noload_passes;}else begin_pass(p,c);open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;++perf.passes;}
@@ -1819,7 +2056,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     {DRAW_SCOPE(Writeback);if(capture.active){if(d.needs_writeback())gpu_sync(perf.sync_writeback);d.writeback();}else d.defer_writeback();}++stats.draws;
     if(capture.active){capture_pass(p);d.capture_read_images();capture.active=false;}
 }
-void dispatch(const p_dispatch &p){CPU_SCOPE(Dispatch);provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");need(state.shader[5],"Dispatch has no genuine compute shader");need(p.x>=0 && p.y>=0 && p.z>=0,"Negative compute dispatch");if(!p.x||!p.y||!p.z)return;need(uint32_t(p.x)<=properties.limits.maxComputeWorkGroupCount[0] && uint32_t(p.y)<=properties.limits.maxComputeWorkGroupCount[1] && uint32_t(p.z)<=properties.limits.maxComputeWorkGroupCount[2],"Compute dispatch exceeds device limit");Commands c;Descriptors &d=acquire_descriptors();descriptors(d,c,true);VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=state.shader[5]->module;ci.stage.pName="main";ci.layout=d.pipeline_layout;PipelineLease pipeline;{CPU_SCOPE(Pipeline);XbgPipelineKey key;bool cacheable=xbg_compute_pipeline_key(key,ci,d.entry->definition.view());pipeline_lookup(pipeline,key,cacheable,nullptr,&ci);}vkCmdBindPipeline(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline.pipeline);vkCmdBindDescriptorSets(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,d.pipeline_layout,0,1,&d.set,uint32_t(d.dynamic_offsets.size()),d.dynamic_offsets.data());vkCmdDispatch(c.command,p.x,p.y,p.z);VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&b,0,nullptr,0,nullptr);c.finish();++perf.dispatches;d.defer_writeback();++stats.dispatches;}
+void dispatch(const p_dispatch &p){CPU_SCOPE(Dispatch);provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");if(submit_trace_left||op_sync){char t[96];snprintf(t,sizeof(t),"D:%s(%d,%d,%d)",state.shader[5]?state.shader[5]->key.c_str():"null",p.x,p.y,p.z);submit_trace_op(t);}need(state.shader[5],"Dispatch has no genuine compute shader");need(p.x>=0 && p.y>=0 && p.z>=0,"Negative compute dispatch");if(!p.x||!p.y||!p.z)return;need(uint32_t(p.x)<=properties.limits.maxComputeWorkGroupCount[0] && uint32_t(p.y)<=properties.limits.maxComputeWorkGroupCount[1] && uint32_t(p.z)<=properties.limits.maxComputeWorkGroupCount[2],"Compute dispatch exceeds device limit");Commands c;Descriptors &d=acquire_descriptors();descriptors(d,c,true);VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=state.shader[5]->module;ci.stage.pName="main";ci.layout=d.pipeline_layout;PipelineLease pipeline;{CPU_SCOPE(Pipeline);XbgPipelineKey key;bool cacheable=xbg_compute_pipeline_key(key,ci,d.entry->definition.view());pipeline_lookup(pipeline,key,cacheable,nullptr,&ci);}vkCmdBindPipeline(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline.pipeline);vkCmdBindDescriptorSets(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,d.pipeline_layout,0,1,&d.set,uint32_t(d.dynamic_offsets.size()),d.dynamic_offsets.data());vkCmdDispatch(c.command,p.x,p.y,p.z);VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&b,0,nullptr,0,nullptr);c.finish();++perf.dispatches;d.defer_writeback();++stats.dispatches;}
 
 struct MaskedClear {
     VkShaderModule vs{},fs{};VkPipelineLayout layout{};VkPipeline pipeline{};
@@ -1930,7 +2167,7 @@ bool guest_texture_write(const tex_t *t,unsigned level,unsigned layer,const NVNc
     }
     return true;
 }
-void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
+void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){submit_trace_op(to_buffer?"T2B":"B2T");
     Image &im=get_image(p.tex,to_buffer);
     if(p.has_view && p.view.set_format)(void)im.view_format(&p.view);
     if(im.samples!=VK_SAMPLE_COUNT_1_BIT || (im.decoded&&to_buffer))
@@ -1988,7 +2225,7 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
     if(to_buffer)vkCmdCopyImageToBuffer(c.command,im.image,im.layout,b.buffer,1,&r);else vkCmdCopyBufferToImage(c.command,b.buffer,im.image,im.layout,1,&r);im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();
     if(to_buffer){gpu_sync(perf.sync_readback);b.invalidate();invalidate_cpu_range(p.src,n);need(xbg_copy_rows_write(reinterpret_cast<void*>(p.src),n,b.mapped,n,plan)==0,"Color copy row writeback failed");}else im.gpu_written=true,provenance_write(im,__LINE__);
 }
-void copy_texture(const p_copy_t2t &p){Image &s=get_image(p.src,true),&d=get_image(p.dst,false);{static unsigned n=0;if(n++<60)xbg_logf("NVN COPYT2T src=%llu fmt=%#x %ux%ux%u L%u lv%u -> dst=%llu fmt=%#x %ux%u L%u lv%u decoded=%d/%d region=%d,%d,%d %dx%dx%d -> %d,%d,%d sv=%d/%u/%u dv=%d/%u/%u",(unsigned long long)p.src->serial,p.src->d.format,s.width,s.height,s.depth,s.layers,s.levels,(unsigned long long)p.dst->serial,p.dst->d.format,d.width,d.height,d.layers,d.levels,int(s.decoded),int(d.decoded),p.sr.xoffset,p.sr.yoffset,p.sr.zoffset,p.sr.width,p.sr.height,p.sr.depth,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,int(p.has_sv),p.has_sv?p.sv.base_level:0,p.has_sv?p.sv.min_layer:0,int(p.has_dv),p.has_dv?p.dv.base_level:0,p.has_dv?p.dv.min_layer:0);}
+void copy_texture(const p_copy_t2t &p){submit_trace_op("T2T");Image &s=get_image(p.src,true),&d=get_image(p.dst,false);{static unsigned n=0;if(n++<60)xbg_logf("NVN COPYT2T src=%llu fmt=%#x %ux%ux%u L%u lv%u -> dst=%llu fmt=%#x %ux%u L%u lv%u decoded=%d/%d region=%d,%d,%d %dx%dx%d -> %d,%d,%d sv=%d/%u/%u dv=%d/%u/%u",(unsigned long long)p.src->serial,p.src->d.format,s.width,s.height,s.depth,s.layers,s.levels,(unsigned long long)p.dst->serial,p.dst->d.format,d.width,d.height,d.layers,d.levels,int(s.decoded),int(d.decoded),p.sr.xoffset,p.sr.yoffset,p.sr.zoffset,p.sr.width,p.sr.height,p.sr.depth,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,int(p.has_sv),p.has_sv?p.sv.base_level:0,p.has_sv?p.sv.min_layer:0,int(p.has_dv),p.has_dv?p.dv.base_level:0,p.has_dv?p.dv.min_layer:0);}
     if(p.has_sv && p.sv.set_format)(void)s.view_format(&p.sv);
     if(p.has_dv && p.dv.set_format)(void)d.view_format(&p.dv);
     // No-BC + ASTC pack (iOS copy_t2t_astc): the game copies file textures (now ASTC 4x4) block-for-block into its own BC3 arrays,
@@ -2053,7 +2290,7 @@ void partial_clear_texture(Image &im,const p_clear_tex &request,uint32_t level,u
     }
     im.gpu_written=true,provenance_write(im,__LINE__);
 }
-void clear_texture(const p_clear_tex &input){
+void clear_texture(const p_clear_tex &input){submit_trace_op("CLR");
     p_clear_tex p=input;
     Image &im=get_image(p.tex,false);need((uint32_t(p.mask)&~15u)==0,"Invalid texture clear mask");if(!p.mask)return;
     uint32_t level=p.has_view&&p.view.set_levels?p.view.base_level:0,layer=p.has_view&&p.view.set_layers?p.view.min_layer:0;
@@ -2096,7 +2333,7 @@ void clear_texture(const p_clear_tex &input){
 }
 // Buffer copy whose source is a pending GPU result: copy on the GPU and keep
 // the destination pending too, instead of stalling for the CPU memmove.
-bool gpu_buffer_copy(uint64_t src,uint64_t dst,uint64_t n){
+bool gpu_buffer_copy(uint64_t src,uint64_t dst,uint64_t n){submit_trace_op("B2B");
     if(!n || (src<dst+n && dst<src+n))return false;
     for(auto &w:pending_writebacks)if(dst<w.addr+w.bytes && dst+n>w.addr)return false;
     Buffer view;if(!pending_view(src,n,1,view))return false;
@@ -2105,7 +2342,7 @@ bool gpu_buffer_copy(uint64_t src,uint64_t dst,uint64_t n){
     VkBufferCopy region{view.offset,b.offset,n};vkCmdCopyBuffer(s.cmd,view.buffer,b.buffer,1,&region);full_barrier(s.cmd);
     pending_writebacks.push_back({dst,n,b,&s});return true;
 }
-void resolve_texture(const p_copy_t2t &p){
+void resolve_texture(const p_copy_t2t &p){submit_trace_op("RES");
     Image &s=get_image(p.src,true),&d=get_image(p.dst,false);
     need(s.samples!=VK_SAMPLE_COUNT_1_BIT && d.samples==VK_SAMPLE_COUNT_1_BIT && s.fmt==d.fmt,"Resolve requires matching MS source / single-sample destination");
     need(s.aspects==VK_IMAGE_ASPECT_COLOR_BIT && d.aspects==VK_IMAGE_ASPECT_COLOR_BIT,"Depth/stencil resolve mode is not yet verified against original NVN");
@@ -2118,7 +2355,12 @@ void resolve_texture(const p_copy_t2t &p){
 
 // CPU-visible writes occur only after all preceding synchronous GPU work finished.
 // Every byte count and opcode is checked; unknown commands terminate with context.
-size_t command_available(const uint8_t *p){uintptr_t address=uintptr_t(p);auto it=pools.upper_bound(address);if(it!=pools.begin()){--it;if(address>=it->first && address-it->first<it->second)return it->second-(address-it->first);}{auto h=host_ranges.upper_bound(address);if(h!=host_ranges.begin()){--h;if(address>=h->first && address-h->first<h->second)return h->second-(address-h->first);}}xbg_fatalf("NVN command address %#llx is outside registered command pools",(unsigned long long)address);}
+// Called for every command header; consecutive commands almost always lie in the same pool.
+uint64_t pools_generation=1;
+size_t command_available(const uint8_t *p){uintptr_t address=uintptr_t(p);
+    static uint64_t last_generation=0;static uintptr_t last_base=0;static size_t last_size=0;
+    if(last_generation==pools_generation && address>=last_base && address-last_base<last_size)return last_size-(address-last_base);
+    auto it=pools.upper_bound(address);if(it!=pools.begin()){--it;if(address>=it->first && address-it->first<it->second){last_generation=pools_generation;last_base=it->first;last_size=it->second;return it->second-(address-it->first);}}{auto h=host_ranges.upper_bound(address);if(h!=host_ranges.begin()){--h;if(address>=h->first && address-h->first<h->second)return h->second-(address-h->first);}}xbg_fatalf("NVN command address %#llx is outside registered command pools",(unsigned long long)address);}
 void execute_draw_call(const xbg_draw_call &p){
     need(p.index_type>=-1 && p.index_type<=2 && p.first>=0 && p.count>=0 && p.instances>=0 && p.base_instance>=0,"Invalid recorded draw plan");
     if(!p.count || !p.instances)return;
@@ -2164,6 +2406,7 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         // Bound host arena use per frame slot; only at command boundaries.
         {Slot &cur=slots[slot_index];if(cur.recording && cur.stream.used_total+cur.readback.used_total>arena_flush_bytes)submit_slots(false);}
         size_t available=command_available(pc);need(available>=8,"Truncated command header");op_hdr h;memcpy(&h,pc,8);need(h.size>=8 && !(h.size&7) && h.size<=available,"NVN command size outside pool");const uint8_t *p=pc+8;size_t n=h.size-8;
+        if(op_sync)switch(h.op){case OP_CLEAR_COLOR:case OP_COUNT_+9:case OP_CLEAR_DS:case OP_BARRIER:case OP_REPORT_COUNTER:case OP_RESET_COUNTER:case OP_COUNT_+1:case OP_COUNT_+4:case OP_SIGNAL_EVENT:{char t[24];snprintf(t,sizeof t,"OP%u",unsigned(h.op));submit_trace_op(t);break;}default:break;}
         switch(h.op){
         case OP_END:return;
         case OP_BEGIN:break;
@@ -2263,27 +2506,29 @@ void zero_copy_probe(){
 extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t bytes){
     if(!c || c->size!=sizeof(*c) || !c->physical || !c->device || !c->queue || !c->shader_directory || !c->fence_timeout_ns){if(error&&bytes)snprintf(error,bytes,"Invalid xbg_game_config");return -1;}
     std::lock_guard<std::recursive_mutex> lock(mutex);if(initialized){if(error&&bytes)snprintf(error,bytes,"Game graphics already initialized");return -1;}
-    cfg=*c;vkGetPhysicalDeviceProperties(cfg.physical,&properties);vkGetPhysicalDeviceMemoryProperties(cfg.physical,&memories);
+    cfg=*c;counter_probe();vkGetPhysicalDeviceProperties(cfg.physical,&properties);vkGetPhysicalDeviceMemoryProperties(cfg.physical,&memories);
     VkPhysicalDeviceProperties2 pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};pp.pNext=&subgroup;vkGetPhysicalDeviceProperties2(cfg.physical,&pp);
     VkPhysicalDeviceFeatures available;vkGetPhysicalDeviceFeatures(cfg.physical,&available);const VkBool32 *want=reinterpret_cast<const VkBool32*>(&cfg.enabled_core),*have=reinterpret_cast<const VkBool32*>(&available);for(size_t i=0;i<sizeof(available)/sizeof(VkBool32);i++)if(want[i]&&!have[i]){if(error&&bytes)snprintf(error,bytes,"Requested enabled feature %zu is unsupported",i);return -1;}
     uint32_t count;vkGetPhysicalDeviceQueueFamilyProperties(cfg.physical,&count,nullptr);std::vector<VkQueueFamilyProperties> queues(count);vkGetPhysicalDeviceQueueFamilyProperties(cfg.physical,&count,queues.data());if(cfg.queue_family>=count || (queues[cfg.queue_family].queueFlags&(VK_QUEUE_GRAPHICS_BIT|VK_QUEUE_COMPUTE_BIT))!=(VK_QUEUE_GRAPHICS_BIT|VK_QUEUE_COMPUTE_BIT)){if(error&&bytes)snprintf(error,bytes,"Graphics+compute queue family required");return -1;}
     timestamp_bits=queues[cfg.queue_family].timestampValidBits;
     {const auto &l=properties.limits;VkDeviceSize a=256;for(VkDeviceSize x:{l.minUniformBufferOffsetAlignment,l.minStorageBufferOffsetAlignment,l.minTexelBufferOffsetAlignment,l.optimalBufferCopyOffsetAlignment,l.nonCoherentAtomSize,VkDeviceSize(16)})while(a<x)a<<=1;arena_alignment=a;}
-    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');std::string marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-mode";FILE *m=fopen(marker.c_str(),"rb");sync_mode=false;if(m){sync_mode=fgetc(m)=='1';fclose(m);}}
+    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');std::string marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-mode";FILE *m=fopen(marker.c_str(),"rb");sync_mode=false;if(m){sync_mode=fgetc(m)=='1';fclose(m);}
+     m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-op-sync").c_str(),"rb");op_sync=false;if(m){op_sync=fgetc(m)=='1';fclose(m);}xbg_logf("NVN SUBMIT_TRACE op_sync=%d",int(op_sync));}
     for(auto &sl:slots)sl=Slot{};slot_index=0;perf=Perf{};for(auto &c:perf_timing_before)c=XbgCpuTiming::Counter{};static_arena.cached=false;support_static.clear();format_property_cache.clear();
     VkPhysicalDeviceShaderDrawParametersFeatures draw_parameters{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};features.pNext=&draw_parameters;vkGetPhysicalDeviceFeatures2(cfg.physical,&features);if(cfg.enabled_shader_draw_parameters && !draw_parameters.shaderDrawParameters){if(error&&bytes)snprintf(error,bytes,"shaderDrawParameters unsupported");return -1;}
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;VkResult r=vkCreateCommandPool(cfg.device,&cp,nullptr,&command_pool);if(r!=VK_SUCCESS){if(error&&bytes)snprintf(error,bytes,"vkCreateCommandPool=%d",r);return r;}
     VkPipelineCacheCreateInfo cache{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};std::vector<uint8_t> cache_data=load_pipeline_cache();cache.initialDataSize=cache_data.size();cache.pInitialData=cache_data.empty()?nullptr:cache_data.data();r=vkCreatePipelineCache(cfg.device,&cache,nullptr,&pipeline_cache);if(r!=VK_SUCCESS){vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;if(error&&bytes)snprintf(error,bytes,"vkCreatePipelineCache=%d",r);return r;}
     xbg_module_id_hook=warm::module_id;{std::string lp=warm::list_path();FILE *nw=fopen((lp.substr(0,lp.find_last_of('/'))+"/gfx-no-warm").c_str(),"rb");warm::enabled=!nw;if(nw)fclose(nw);}warm::start();
     state=State{};state.color.logic_op=3;state.color.alpha_func=8;for(unsigned i=0;i<8;i++)state.blend[i]={i,2,1,2,1,1,1};stats.reset();timing=XbgCpuTiming(timing_clock);pipeline_counts={};pipeline_before={};pipeline_tick=0;timing_active=false;timing_first=timing_last=0;live_profile_used=false;descriptor_detail=false;descriptor_timing=XbgDescriptorTiming{};descriptor_root=nullptr;draw_detail=false;draw_timing=XbgDrawTiming{};draw_root=nullptr;completed=0;last_attachment_trace=UINT64_MAX;sampler_mirror_clamp_enabled=VK_FALSE;failed=false;error_text[0]=0;initialized=true;
-    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-noload").c_str(),"rb");if(w){noload_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;fclose(w);}xbg_logf("NVN wtrack enabled=%d",int(wtrack::enabled));}
+    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-noload").c_str(),"rb");if(w){noload_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;fclose(w);}}{perf_parts_marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-perf-parts";FILE *w=fopen(perf_parts_marker.c_str(),"rb");perf_timing=!w;if(w)fclose(w);xbg_logf("NVN caps perf-parts=%d",int(perf_timing));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{own_marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-own";own_enabled=access(own_marker.c_str(),F_OK)!=0;}{readback_marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-readback-uncached";readback_cached=access(readback_marker.c_str(),F_OK)!=0;epoch_gc_marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-epoch-gc";epoch_gc=access(epoch_gc_marker.c_str(),F_OK)!=0;
+     for(uint32_t i=0;i<memories.memoryTypeCount;i++)xbg_logf("NVN memtype %u heap=%u flags=%#x",i,memories.memoryTypes[i].heapIndex,unsigned(memories.memoryTypes[i].propertyFlags));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;fclose(w);}xbg_logf("NVN wtrack enabled=%d",int(wtrack::enabled));}
      zero_copy_probe();
      {uint32_t n=0;vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data());
       std::string list;for(auto &e:ext){list+=e.extensionName;list+=' ';}
       for(size_t at=0;at<list.size();at+=900)xbg_logf("NVN caps extensions[%zu] %s",at/900,list.substr(at,900).c_str());
       xbg_logf("NVN caps api=%u.%u.%u driver=%u maxUBdyn=%u maxPerStageUB=%u minUBAlign=%llu maxBoundSets=%u",VK_API_VERSION_MAJOR(properties.apiVersion),VK_API_VERSION_MINOR(properties.apiVersion),VK_API_VERSION_PATCH(properties.apiVersion),properties.driverVersion,properties.limits.maxDescriptorSetUniformBuffersDynamic,properties.limits.maxPerStageDescriptorUniformBuffers,(unsigned long long)properties.limits.minUniformBufferOffsetAlignment,properties.limits.maxBoundDescriptorSets);}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-ab-toggle").c_str(),"rb");ab_period=0;if(m){if(fscanf(m,"%d",&ab_period)!=1)ab_period=0;fclose(m);}xbg_logf("NVN PERF ab_period=%d",ab_period);}
-     ++slot_serial;gfx_enqueued=0;gfx_executed=0;gfx_presents_queued=0;gfx_async=!sync_submit && !sync_mode;if(gfx_async)gfx_worker=std::thread(gfx_worker_loop);xbg_logf("NVN async translation=%d",int(gfx_async));}
+     ++slot_serial;gfx_enqueued=0;gfx_executed=0;gfx_presents_queued=0;gfx_async=!sync_submit && !sync_mode;if(gfx_async)gfx_worker=std::thread(gfx_worker_loop);if(gfx_async){queue_sync_marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-queue";queue_async=access(queue_sync_marker.c_str(),F_OK)!=0;queue_worker=std::thread(queue_worker_loop);xbg_logf("NVN async queue=%d",int(queue_async));}xbg_logf("NVN async translation=%d",int(gfx_async));}
     return 0;
 }
 extern "C" int xbg_game_set_sampler_mirror_clamp_to_edge(VkBool32 enabled){
@@ -2299,7 +2544,7 @@ extern "C" int xbg_game_set_sampler_mirror_clamp_to_edge(VkBool32 enabled){
     sampler_mirror_clamp_enabled=enabled;xbg_logf("NVN sampler mirror-clamp-to-edge actualEnabled=%u",enabled);return 0;
 }
 
-extern "C" int xbg_game_provenance(const char *path){
+extern "C" int xbg_game_provenance(const char *path){if(on_queue_worker)return -1;
     std::lock_guard<std::recursive_mutex> lock(mutex);
     if(!path){provenance_close("CLOSE");return 0;}
     if(!initialized || provenance_file || capture.trace || timing_active || timing_first || failed || stats.presents.load()>UINT64_MAX-2)return -1;
@@ -2318,7 +2563,7 @@ extern "C" int xbg_game_capture_frame(const char *directory,uint64_t frame){
     capture_log("CAPTURE version=1 frame=%llu maxEvents=16 maxBytes=%llu semantics=post-fence-raw-no-state-replacement",(unsigned long long)frame,(unsigned long long)capture_limit);
     xbg_logf("NVN one-frame capture frame=%llu directory=%s maxEvents=16 maxBytes=%llu",(unsigned long long)frame,directory,(unsigned long long)capture_limit);return 0;
 }
-extern "C" int xbg_game_profile_cpu_live(uint32_t frame_count){gfx_drain();
+extern "C" int xbg_game_profile_cpu_live(uint32_t frame_count){if(on_queue_worker)return -1;gfx_drain();
     if(!frame_count || frame_count>60)return -1;
     std::lock_guard<std::recursive_mutex> lock(mutex);
     const uint64_t current=stats.presents.load();
@@ -2329,7 +2574,7 @@ extern "C" int xbg_game_profile_cpu_live(uint32_t frame_count){gfx_drain();
     xbg_logf("NVN CPU_TIMING armed-live first=%llu count=%u maxSeconds=60 clock=steady elapsed-not-thread-cpu once=1",(unsigned long long)timing_first,frame_count);
     return 0;
 }
-extern "C" int xbg_game_profile_descriptor_live(uint32_t frame_count){gfx_drain();
+extern "C" int xbg_game_profile_descriptor_live(uint32_t frame_count){if(on_queue_worker)return -1;gfx_drain();
     std::lock_guard<std::recursive_mutex> lock(mutex);
     // Reuse exact once/pending/active/nonempty-scope/provenance/capture checks.
     int result=xbg_game_profile_cpu_live(frame_count);if(result)return result;
@@ -2337,7 +2582,7 @@ extern "C" int xbg_game_profile_descriptor_live(uint32_t frame_count){gfx_drain(
     xbg_logf("NVN DESC_TIMING armed v=2 first=%llu count=%u once=1 maxSeconds=60",(unsigned long long)timing_first,frame_count);
     return 0;
 }
-extern "C" int xbg_game_profile_draw_live(uint32_t frame_count){gfx_drain();
+extern "C" int xbg_game_profile_draw_live(uint32_t frame_count){if(on_queue_worker)return -1;gfx_drain();
     std::lock_guard<std::recursive_mutex> lock(mutex);
     // Reuse the original live once/pending/active/provenance/capture gates.
     int result=xbg_game_profile_cpu_live(frame_count);if(result)return result;
@@ -2353,12 +2598,12 @@ extern "C" int xbg_game_profile_cpu(uint64_t first_frame,uint32_t frame_count){
     xbg_logf("NVN CPU_TIMING armed first=%llu count=%u maxSeconds=60 clock=steady elapsed-not-thread-cpu",(unsigned long long)first_frame,frame_count);
     if(first_frame==1)timing_start();return 0;
 }
-extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;destroy_slots();clear_pipeline_objects();warm::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
+extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();epochs.clear();queue_stop_worker();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;destroy_slots();clear_pipeline_objects();warm::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();++pools_generation;host_segments.clear();host_ranges.clear();host_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
 extern "C" void xbg_game_get_stats(xbg_game_stats *out){if(out)*out={stats.submissions.load(),stats.draws.load(),stats.dispatches.load(),stats.presents.load(),stats.shader_loads.load()};}
-static void xbg_legacy_pool_add_now(void *p,size_t n){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&n,"Invalid NVN pool");pools[uintptr_t(p)]=n;auto epoch=provenance.pool(uint64_t(p),true);provenance_log("POOL_ADD mem=%p bytes=%zu epoch=%llu",p,n,epoch);}
-static void xbg_legacy_pool_del_now(void *p){std::lock_guard<std::recursive_mutex> lock(mutex);provenance_log("POOL_DEL mem=%p epoch=%llu",p,provenance.epoch(uint64_t(p)));provenance.pool(uint64_t(p),false);pools.erase(uintptr_t(p));}
+static void xbg_legacy_pool_add_now(void *p,size_t n){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&n,"Invalid NVN pool");pools[uintptr_t(p)]=n;++pools_generation;auto epoch=provenance.pool(uint64_t(p),true);provenance_log("POOL_ADD mem=%p bytes=%zu epoch=%llu",p,n,epoch);}
+static void xbg_legacy_pool_del_now(void *p){std::lock_guard<std::recursive_mutex> lock(mutex);provenance_log("POOL_DEL mem=%p epoch=%llu",p,provenance.epoch(uint64_t(p)));provenance.pool(uint64_t(p),false);pools.erase(uintptr_t(p));++pools_generation;}
 static void xbg_register_texture_now(const dpool_t *p,int id,const tex_t *t,const view_t *v){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&id>=0&&id<p->n&&t,"Invalid texture registration");RegisteredTexture r;r.texture=*t;if(v){r.view=*v;r.has_view=true;}
-    auto &slot=textures[pool_key(p)][id];if(memcmp(&slot.texture,&r.texture,sizeof(r.texture)) || slot.has_view!=r.has_view || (r.has_view && memcmp(&slot.view,&r.view,sizeof(r.view))))++memo_bump[0];slot=r;}
+    auto &slot=textures[pool_key(p)][id];if(memcmp(&slot.texture,&r.texture,sizeof(r.texture)) || slot.has_view!=r.has_view || (r.has_view && memcmp(&slot.view,&r.view,sizeof(r.view)))){++memo_bump[0];if(slot.texture.serial && slot.texture.serial==r.texture.serial)++tex_reg_same_serial;r.version=++texture_versions;}else r.version=slot.version;slot=r;}
 static void xbg_register_sampler_now(const dpool_t *p,int id,const samp_par *s){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&id>=0&&id<p->n&&s,"Invalid sampler registration");auto &slot=samplers[pool_key(p)][id];if(memcmp(&slot,s,sizeof(*s))){++memo_epoch;++memo_bump[1];}slot=*s;}
 static void xbg_legacy_tex_release_now(tex_t *t){std::lock_guard<std::recursive_mutex> lock(mutex);if(t){auto i=images.find(t->serial);if(i!=images.end()){provenance_image("RELEASE",t,*i->second);retire_object(i->second);++memo_bump[2];}images.erase(t->serial);image_index_dirty=true;}}
 static void xbg_legacy_prog_release_now(prog_t *p){/* Immutable shader modules are keyed by original control digest, shared safely. */std::lock_guard<std::recursive_mutex> lock(mutex);if(p && p->serial)program_cache.erase(p->serial);}
@@ -2400,8 +2645,11 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){++gfx_wait_calls
     if(failed)return 0;if(fence<=completed)return 1;
     if(!timeout){if(!gpu_poll_complete())return 0;return fence<=completed;}
     ++perf.why_wait;wait_fence(fence);return fence<=completed;}
-extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(initialized,"Queue finish before Vulkan initialization");++perf.why_finish;complete_all();VK(vkQueueWaitIdle(cfg.queue));}
-static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);{TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}if(r)xbg_fatalf("Game presentation failed: %d",r);++stats.presents;perf.present_cpu_ns+=timing_clock()-present_begin;perf_frame();if(provenance_file && stats.presents.load()>=provenance.target)provenance_close("END");if(capture.trace && stats.presents==capture.frame){capture_log("END frame=%llu events=%u bytes=%llu presentedSerial=%llu image=%p",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes,(unsigned long long)texture->serial,(void*)im.image);fclose(capture.trace);capture.trace=nullptr;capture.active=false;xbg_logf("NVN one-frame capture complete frame=%llu events=%u bytes=%llu",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes);}}timing_boundary();}
+extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(initialized,"Queue finish before Vulkan initialization");++perf.why_finish;complete_all();queue_drain();VK(vkQueueWaitIdle(cfg.queue));}
+static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);{TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);c.finish();submit_slots(op_sync);if(op_sync)xbg_logf("NVN SUBMIT_TRACE opsync present-ready");{CPU_SCOPE(Present);
+     if(queue_async){std::unique_lock<std::mutex> l(queue_mutex);queue_progress_cv.wait(l,[]{return queue_presents.load()<2;});}
+     struct Args{void *native;VkImage image;VkFormat fmt;uint32_t w,h;int32_t crop[4];int32_t interval;} a{window->native,im.image,im.fmt,im.width,im.height,{},window->interval};memcpy(a.crop,window->crop,sizeof a.crop);
+     ++queue_presents;queue_run([a]{int r=cfg.present(cfg.userdata,a.native,a.image,a.fmt,a.w,a.h,a.crop,a.interval);--queue_presents;if(r)xbg_fatalf("Game presentation failed: %d",r);});}++stats.presents;perf.present_cpu_ns+=timing_clock()-present_begin;perf_frame();if(provenance_file && stats.presents.load()>=provenance.target)provenance_close("END");if(capture.trace && stats.presents==capture.frame){capture_log("END frame=%llu events=%u bytes=%llu presentedSerial=%llu image=%p",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes,(unsigned long long)texture->serial,(void*)im.image);fclose(capture.trace);capture.trace=nullptr;capture.active=false;xbg_logf("NVN one-frame capture complete frame=%llu events=%u bytes=%llu",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes);}}timing_boundary();}
 extern "C" void xbg_legacy_read_texels(const tex_t *t,unsigned level,unsigned layer,const NVNcopyRegion *r,uint8_t *dst,size_t row,size_t image){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(t&&r&&dst,"Invalid ReadTexels arguments");auto found=images.find(t->serial);if(found==images.end() || !found->second->gpu_written){int bw,bh,bpp=nvn_fmt_bpb(t->d.format,&bw,&bh);need(bpp && r->xoffset==0 && r->yoffset==0 && r->zoffset==0 && r->depth==1 && uint32_t(r->width)==std::max(1u,t->d.width>>level) && uint32_t(r->height)==std::max(1u,t->d.height>>level),"CPU ReadTexels partial region unsupported");need(!(t->d.flags&0x10),"Linear CPU ReadTexels not implemented");need(nvn_deswizzle(&t->d,level,layer,t->mem,dst,row)==0,"ReadTexels deswizzle failed");}
     else{need(image==row*size_t(r->height),"ReadTexels image padding not implemented");p_copy_b2t p{};p.src=uint64_t(dst);p.tex=t;p.has_view=1;p.view.set_levels=p.view.set_layers=1;p.view.base_level=level;p.view.nlevels=1;p.view.min_layer=layer;p.view.nlayers=1;p.r=*r;int64_t old=state.copy_stride;state.copy_stride=row;copy_texture_buffer(p,true);state.copy_stride=old;}}
 

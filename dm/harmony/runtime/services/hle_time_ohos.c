@@ -42,7 +42,8 @@ HLE_FORCE("time", "按返回点认出建局种子那一处（SW_FIXED_TIME）；
 HLE_FORCE("_ZN2nn4time10InitializeEv", "连 time 服务；时钟改取宿主系统时间", Result, h_time_Initialize, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn4time13IsInitializedEv", "time 服务已被接管，恒为已初始化", int, h_time_IsInitialized, void) { return 1; }
 HLE_FORCE("_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", "用户时钟 → 宿主 time()", Result, h_time_GetCurrentTime, int64_t *out) {
-    int64_t ft = fixed_time(); *out = ft >= 0 ? ft : time(NULL); return RES_OK;
+    int64_t ft = fixed_time(); *out = ft >= 0 ? ft : time(NULL);
+    xblr_hle_note("clock %lld", (long long)*out); return RES_OK;
 }
 // 首领连战第 6–10 关的强制恐怖地带（sw_bossrush.c 设）：g_sw_tz_time 非 0 且未过期时，只有「恐怖地带」那几处取时钟拿到它，存档时间等其余调用照旧。
 // 哪几处：返回点落在地带函数 0x58f1e0 起的那一簇（0x58f1e0–0x591440），或返回后 8 条指令内调地带日程 0x58f310（服务端 0x636b38 套地带、0x694b48 等 9 处）。

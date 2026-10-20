@@ -51,22 +51,30 @@ def classify(w,a):
     i=dis(w,a)
     if i and re.search(r'\b[xw]18\b',i.op_str):return 'plain',0
     return None
+FLAG_WRITE={'adds','subs','adcs','sbcs','ands','bics','eons','orns','cmn','cmp','tst','ccmn','ccmp','fcmp','fcmpe','ngcs'}
+FLAG_READ={'adc','sbc','ngc','csel','csinc','csinv','csneg','cset','csetm','cinc','cinv','cneg','fcsel'}
 def op_body(ins,label,window=None,tail_targets=None):
-    # Use only caller-saved scratch registers, while preserving the C ABI with a
-    # full callee-saved spill. The frame's SIMD and status state is loaded before
-    # the ONE original operation and written back immediately afterward.
-    window=window or [ins];regs=set()
+    # Use only caller-saved scratch registers. Only the state the original
+    # operation actually reads is loaded from the frame, and only that state is
+    # written back: loading every q register and FPCR per gated instruction
+    # measured as the dominant guest-thread cost (millions of gates/second).
+    window=window or [ins];regs=set();qload=set();flags=False;fp=False
     for item in window:
         regs|={int(x) for x in re.findall(r'\b[xw](\d+)\b',item.op_str)}
+        qload|={int(x) for x in re.findall(r'\b[vqdshb](\d+)\b',item.op_str)}
         rr,rw=item.regs_access()
         for r in rr+rw:
             n=item.reg_name(r)
             if n=='lr':regs.add(30)
             elif n=='fp':regs.add(29)
             elif re.fullmatch('[xw][0-9]+',n):regs.add(int(n[1:]))
+            elif re.fullmatch('[vq][0-9]+',n):qload.add(int(n[1:]))
+            elif n=='nzcv':flags=True
+        if item.mnemonic in FLAG_READ|FLAG_WRITE or item.mnemonic.startswith('b.'):flags=True
+    fp=bool(qload)
     scratch=[r for r in range(0,16) if r not in regs]
     assert len(scratch)>=4,f'not enough safe scratch registers at {ins.address:x}'
-    fp,tmp,spreg,edge=scratch[:4];mapping={18:tmp}
+    fpreg,tmp,spreg,edge=scratch[:4];mapping={18:tmp}
     has_sp=any(re.search(r'\bw?sp\b',item.op_str) for item in window)
     for item in window:
         if re.search(r'\bw?sp\b',item.op_str):
@@ -75,16 +83,25 @@ def op_body(ins,label,window=None,tail_targets=None):
     if has_sp:mapping[31]=spreg
     if len(window)==1 and ins.mnemonic in ('ldxr','ldaxr','ldxp','ldaxp','stxr','stlxr','stxp','stlxp'):
         raise ValueError(f'exclusive operation needs a whole-window rewrite: {ins.address:x}')
-    lines=[f'{label}:','sub sp, sp, #256']
-    for r in range(19,31,2):lines.append(f'stp x{r}, x{r+1}, [sp, #{(r-19)*8}]')
-    for r in range(8,16,2):lines.append(f'stp q{r}, q{r+1}, [sp, #{96+(r-8)*16}]')
-    lines.append(f'mov x{fp}, x0')
-    # q loads precede flags, and none of the scaffolding changes NZCV.
-    for r in range(0,32,2):lines.append(f'ldp q{r}, q{r+1}, [x{fp}, #{256+r*16}]')
-    for off,name in ((768,'nzcv'),(776,'fpcr'),(784,'fpsr')):
-        lines.extend([f'ldr x{tmp}, [x{fp}, #{off}]',f'msr {name}, x{tmp}'])
-    for r in sorted(regs):lines.append(f'ldr x{mapping.get(r,r)}, [x{fp}, #{r*8}]')
-    if has_sp:lines.append(f'ldr x{spreg}, [x{fp}, #248]')
+    # Only q8-q15 the operation touches need spilling (AAPCS callee-saved; the
+    # gate calls C between saving the frame and invoking this leaf).
+    qspill=sorted(q for q in qload if 8<=q<=15)
+    # Same for x19-x29 (callee-saved) and x30 (needed by the final ret): the
+    # dispatcher keeps live values there across the call into this leaf.
+    gspill=sorted(r for r in regs if 19<=r<=30)
+    gbase=16*len(qspill);spill=(gbase+8*len(gspill)+15)&~15
+    lines=[f'{label}:']
+    if spill:lines.append(f'sub sp, sp, #{spill}')
+    for i,q in enumerate(qspill):lines.append(f'str q{q}, [sp, #{16*i}]')
+    for i,r in enumerate(gspill):lines.append(f'str x{r}, [sp, #{gbase+8*i}]')
+    lines.append(f'mov x{fpreg}, x0')
+    for r in sorted(qload):lines.append(f'ldr q{r}, [x{fpreg}, #{256+r*16}]')
+    if flags:lines.extend([f'ldr x{tmp}, [x{fpreg}, #768]',f'msr nzcv, x{tmp}'])
+    if fp:
+        for off,name in ((776,'fpcr'),(784,'fpsr')):
+            lines.extend([f'ldr x{tmp}, [x{fpreg}, #{off}]',f'msr {name}, x{tmp}'])
+    for r in sorted(regs):lines.append(f'ldr x{mapping.get(r,r)}, [x{fpreg}, #{r*8}]')
+    if has_sp:lines.append(f'ldr x{spreg}, [x{fpreg}, #248]')
     addrs={item.address for item in window};edges={}
     for item in window:
         lines.append(f'{label}_at_{item.address:x}:')
@@ -100,16 +117,52 @@ def op_body(ins,label,window=None,tail_targets=None):
         lines.append(f'b {label}_writeback')
         for target,dest in edges.items():
             tail=tail_targets[target]
-            lines += [f'{dest}:',f'adrp x{edge}, {tail}',f'add x{edge}, x{edge}, :lo12:{tail}',f'str x{edge}, [x{fp}, #792]',f'b {label}_writeback']
+            lines += [f'{dest}:',f'adrp x{edge}, {tail}',f'add x{edge}, x{edge}, :lo12:{tail}',f'str x{edge}, [x{fpreg}, #792]',f'b {label}_writeback']
         lines.append(f'{label}_writeback:')
-    for r in sorted(regs):lines.append(f'str x{mapping.get(r,r)}, [x{fp}, #{r*8}]')
-    if has_sp:lines.append(f'str x{spreg}, [x{fp}, #248]')
-    for off,name in ((768,'nzcv'),(776,'fpcr'),(784,'fpsr')):
-        lines.extend([f'mrs x{tmp}, {name}',f'str x{tmp}, [x{fp}, #{off}]'])
-    for r in range(0,32,2):lines.append(f'stp q{r}, q{r+1}, [x{fp}, #{256+r*16}]')
-    for r in range(8,16,2):lines.append(f'ldp q{r}, q{r+1}, [sp, #{96+(r-8)*16}]')
-    for r in range(19,31,2):lines.append(f'ldp x{r}, x{r+1}, [sp, #{(r-19)*8}]')
-    lines+=['add sp, sp, #256','ret'];return lines
+    for r in sorted(regs):lines.append(f'str x{mapping.get(r,r)}, [x{fpreg}, #{r*8}]')
+    if has_sp:lines.append(f'str x{spreg}, [x{fpreg}, #248]')
+    if flags:lines.extend([f'mrs x{tmp}, nzcv',f'str x{tmp}, [x{fpreg}, #768]'])
+    if fp:
+        for off,name in ((776,'fpcr'),(784,'fpsr')):
+            lines.extend([f'mrs x{tmp}, {name}',f'str x{tmp}, [x{fpreg}, #{off}]'])
+    for r in sorted(qload):lines.append(f'str q{r}, [x{fpreg}, #{256+r*16}]')
+    for i,q in enumerate(qspill):lines.append(f'ldr q{q}, [sp, #{16*i}]')
+    for i,r in enumerate(gspill):lines.append(f'ldr x{r}, [sp, #{gbase+8*i}]')
+    if spill:lines.append(f'add sp, sp, #{spill}')
+    lines+=['ret'];return lines
+# Fast gate prologue: find the current xblr_guest_thread without saving the frame or
+# calling C. tpidr_el0-272 holds the musl TSD array (G20); xblr_fast_tsd is the
+# runtime-verified byte offset of the thread key in it, or bit 63 set when the
+# layout check failed (then every fast stub falls through to the full gate).
+# Uses no flags, no FP state and moves sp by exactly 16 around the stub only.
+TLR_OFFSET=0x2010
+def fast_thread(a,b,label):
+    return [f'stp x{a}, x{b}, [sp, #-16]!',f'adrp x{a}, xblr_fast_tsd',f'ldr x{a}, [x{a}, :lo12:xblr_fast_tsd]',
+            f'tbnz x{a}, #63, {label}_slow','mrs x{0}, tpidr_el0'.format(b),f'sub x{b}, x{b}, #272',
+            f'ldr x{b}, [x{b}]',f'ldr x{a}, [x{b}, x{a}]']
+def fast_temps(used):
+    free=[r for r in (16,17,15,14,13,12,11,10,9) if r not in used]
+    return free[0],free[1]
+def fast_x18(ins,label,resume):
+    """Run one plain x18 instruction natively with guest x18 = thread->virtual_x18."""
+    if re.search(r'\bw?sp\b',ins.op_str) or ins.mnemonic.startswith(('ld','st','prfm')) and '[' not in ins.op_str:return None
+    if ins.mnemonic in ('adr','adrp','br','blr','ret','b','bl','cbz','cbnz','tbz','tbnz','svc') or ins.mnemonic.startswith('b.'):return None
+    if re.match(r'(ld|st)a?x[rp]|stlx[rp]|ldax[rp]',ins.mnemonic):return None
+    used={int(x) for x in re.findall(r'\b[xw](\d+)\b',ins.op_str)}
+    rr,rw=ins.regs_access()
+    for r in rr+rw:
+        n=ins.reg_name(r)
+        if n in ('sp','wsp'):return None
+        if re.fullmatch('[xw][0-9]+',n):used.add(int(n[1:]))
+        elif n=='lr':used.add(30)
+        elif n=='fp':used.add(29)
+    a,b=fast_temps(used)
+    return fast_thread(a,b,label)+[f'ldr x{b}, [x{a}]',f'.inst 0x{rewrite_regs(ins,{18:b}):08x}',f'str x{b}, [x{a}]',
+                                   f'ldp x{a}, x{b}, [sp], #16',f'b {resume}'],a,b
+def fast_tlr(dest,label,resume):
+    a,b=fast_temps({dest})
+    return fast_thread(a,b,label)+[f'add x{dest}, x{a}, #{TLR_OFFSET>>12}, lsl #12',f'add x{dest}, x{dest}, #{TLR_OFFSET&0xfff}',
+                                   f'ldp x{a}, x{b}, [sp], #16',f'b {resume}'],a,b
 def check_window_entries(raw,end,windows):
     covered={i.address for body in windows.values() for i in body}
     interiors=covered-set(windows)
@@ -226,7 +279,8 @@ def generate(inputs,out):
         for idx,(a,w,kind,arg) in enumerate(sites):
             ins=dis(w,a);label=f'xblr_{name}_s{idx}';original=f'xblr_{name}_base + {a}'
             target=0;extra=0;fn='0';resume=label+'_resume';taken='0';base=0;count=0
-            resume_offset=a+4
+            resume_offset=a+4;fast=None
+            if kind=='tlr_read' and arg<31:fast=fast_tlr(arg,label,f'xblr_{name}_base + {a+4}')
             if kind in ('window','hotloop'):
                 body=windows[a];resume_offset=body[-1].address+4;tail_targets={}
                 for item in body:
@@ -269,8 +323,14 @@ def generate(inputs,out):
                     if w in opcache:fn=opcache[w]
                     else:
                         fn=label+'_op';ops.append((fn,op_body(ins,fn)));opcache[w]=fn
+                    if arg==0:fast=fast_x18(ins,label,f'xblr_{name}_base + {resume_offset}')
             stats[kind]+=1
-            stubs += [f'.global {label}',f'.hidden {label}',f'{label}:','sub sp, sp, #256','stp x16, x30, [sp]',
+            if fast:stats['fast_'+kind]+=1
+            stubs += [f'.global {label}',f'.hidden {label}',f'{label}:']
+            if fast:
+                lines,ta,tb=fast
+                stubs += lines+[f'{label}_slow:',f'ldp x{ta}, x{tb}, [sp], #16']
+            stubs += ['sub sp, sp, #256','stp x16, x30, [sp]',
                       f'adrp x16, {label}_meta',f'add x16, x16, :lo12:{label}_meta','bl xblr_instruction_gate',
                       f'{resume}:','ldp x16, x17, [sp], #16',f'b xblr_{name}_base + {resume_offset}']
             meta += [f'{label}_meta:',f'.xword {fn}',f'.xword {original}',f'.xword {resume}',f'.xword {taken}',

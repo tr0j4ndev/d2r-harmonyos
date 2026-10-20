@@ -3,6 +3,7 @@
 //   一个 GOB = 64 字节 × 8 行 = 512 字节；块高（tileH，单位 GOB）按「高度×1.5」挑；各级按块对齐累加。
 // 游戏的预排布贴图（SetPackagedTextureLayout）带 8 字节布局参数：第 0 字节 = 块高 log2（10-01 真游戏 16 例对照得出，
 // 其中 4 例与自动算法不同），有它时以它为准。
+#include <stdio.h>
 #include "nvn_tex.h"
 
 typedef struct { uint8_t bpb, bw, bh; } fmt_t;   // 每块字节、块宽、块高（非压缩格式块宽高 = 1）
@@ -77,6 +78,27 @@ static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl,
 }
 
 void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
+    /* 客体偶尔会把荒谬的宽高喂进来（实测 0x464C457F，一段 ELF 头残留被当成了尺寸）：
+     * 那样会算出 27 TB，游戏随后拿这个值查自己的分配表、查不到就空指针崩（NSO text 0x17417a4）。
+     * 游戏自己的代码在尺寸为 0 时回退到 1280x720（main 0x17413d8），这里做同样的兜底，
+     * 保证「端口返回的尺寸/对齐」与游戏自己的记账一致（它就是用这个返回值查表的）。
+     * 异常仍大声打出来，不掩盖。
+     * The guest occasionally feeds us an absurd width/height (measured 0x464C457F, leftover ELF header
+     * bytes taken as a size): that computes 27 TB, the game then looks that value up in its own
+     * allocation table, misses and dereferences NULL (NSO text 0x17417a4). The game itself falls back to
+     * 1280x720 when the size is zero (main 0x17413d8); do the same here so the size/alignment the port
+     * returns stays consistent with the game\`s own bookkeeping (that return value is its lookup key).
+     * The anomaly is still printed loudly; nothing is hidden. */
+    nvn_texdesc fix = *d;
+    if (fix.width == 0 || fix.width > 16384u) {
+        fprintf(stderr, "[nvn-tex] WIDTH-OOB %u -> using the game's own fallback 1280 | 宽度越界\n", fix.width);
+        fix.width = 1280;
+    }
+    if (fix.height == 0 || fix.height > 16384u) {
+        fprintf(stderr, "[nvn-tex] HEIGHT-OOB %u -> using the game's own fallback 720 | 高度越界\n", fix.height);
+        fix.height = 720;
+    }
+    d = &fix;
     fmt_t t = fmt_of(d->format);
     unsigned dpl; int layered; uint32_t w, h, z;
     shape(d, &dpl, &layered, &w, &h, &z);

@@ -3,6 +3,7 @@
 #include "game_graphics.h"
 // Matching graphics API contract, provided by the paired candidate.
 extern "C" int xbg_game_profile_draw_live(uint32_t frame_count);
+extern "C" void XblCpuSamplerPoll(const char *files_dir);
 
 #include "runtime_bridge.h"
 
@@ -341,6 +342,12 @@ struct Session {
     uint32_t family{};VkSurfaceKHR surface{};VkSwapchainKHR swap{};
 
     VkPhysicalDeviceFeatures enabled{};VkBool32 drawParameters{};
+    VkPhysicalDeviceShaderFloat16Int8Features float16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};bool float16Usable=false;
+    VkPhysicalDevice16BitStorageFeatures s16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};
+    VkPhysicalDevice8BitStorageFeatures s8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES};
+    bool s16Usable=false,s8Usable=false;
+    VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    bool faultEnabled=false,faultDumped=false;
 
     bool mirrorClampEnabled=false;
 
@@ -536,7 +543,23 @@ struct Session {
 
     void log(const char *text){FILE *f=fopen(logPath.c_str(),"ab");if(f){fprintf(f,"%s\n",text);fclose(f);}}
 
-    void check(VkResult r,const char *what){if(r!=VK_SUCCESS)throw std::runtime_error(std::string(what)+" VkResult="+std::to_string(r));}
+    void dumpDeviceFault(){
+        if(faultDumped)return;faultDumped=true;
+        if(!faultEnabled){log("deviceFault unavailable");return;}
+        auto fn=reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(vkGetDeviceProcAddr(device,"vkGetDeviceFaultInfoEXT"));
+        if(!fn){log("deviceFault no entry point");return;}
+        VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};VkResult r=fn(device,&counts,nullptr);
+        char line[512];snprintf(line,sizeof(line),"deviceFault counts rc=%d addresses=%u vendor=%u binary=%llu",int(r),counts.addressInfoCount,counts.vendorInfoCount,(unsigned long long)counts.vendorBinarySize);log(line);
+        if(r!=VK_SUCCESS && r!=VK_INCOMPLETE)return;
+        std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+        counts.vendorBinarySize=0;VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};info.pAddressInfos=addresses.data();info.pVendorInfos=vendor.data();
+        r=fn(device,&counts,&info);
+        snprintf(line,sizeof(line),"deviceFault info rc=%d description=%s",int(r),info.description);log(line);
+        for(uint32_t i=0;i<counts.addressInfoCount;i++){snprintf(line,sizeof(line),"deviceFault address[%u] type=%d reported=%#llx precision=%#llx",i,int(addresses[i].addressType),(unsigned long long)addresses[i].reportedAddress,(unsigned long long)addresses[i].addressPrecision);log(line);}
+        for(uint32_t i=0;i<counts.vendorInfoCount;i++){snprintf(line,sizeof(line),"deviceFault vendor[%u] code=%#llx data=%#llx description=%s",i,(unsigned long long)vendor[i].vendorFaultCode,(unsigned long long)vendor[i].vendorFaultData,vendor[i].description);log(line);}
+    }
+
+    void check(VkResult r,const char *what){if(r==VK_ERROR_DEVICE_LOST)dumpDeviceFault();if(r!=VK_SUCCESS)throw std::runtime_error(std::string(what)+" VkResult="+std::to_string(r));}
 
     void need(bool ok,const char *what){if(!ok)throw std::runtime_error(what);}
 
@@ -620,7 +643,7 @@ struct Session {
 
         VkPhysicalDeviceShaderDrawParametersFeatures draw{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};
 
-        VkPhysicalDeviceFeatures2 fs{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};fs.pNext=&draw;vkGetPhysicalDeviceFeatures2(physical,&fs);
+        VkPhysicalDeviceFeatures2 fs{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};s16.pNext=&s8;float16.pNext=&s16;draw.pNext=&float16;fs.pNext=&draw;vkGetPhysicalDeviceFeatures2(physical,&fs);
 
         enabled=fs.features;drawParameters=draw.shaderDrawParameters;
 
@@ -655,6 +678,40 @@ struct Session {
         {uint32_t n=0;vkEnumerateDeviceExtensionProperties(physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(physical,nullptr,&n,ext.data());
          for(auto &e:ext)if(!strcmp(e.extensionName,VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)){deviceExt.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);break;}}
 
+        /* 客体有计算着色器需要 Float16（SPIR-V 能力 10）：支持就启用扩展并链上特性，
+         * 并把结果告诉图形层（它的能力表据此判断）。
+         * 另外，游戏对未使用的可写图像槽会绑 null 句柄（NVN 允许），图形层要用
+         * VK_EXT_robustness2 的 nullDescriptor 处理它——也在这里启用。
+         * The guest has compute shaders requiring Float16 (SPIR-V capability 10): enable the extension and
+         * chain the feature when supported, and tell the graphics layer (its capability table consults it).
+         * Also, the game binds null handles for unused writable image slots (NVN allows it) and the graphics
+         * layer handles those through VK_EXT_robustness2's nullDescriptor, so enable that here too. */
+        {
+            void *chain=nullptr;
+            VkPhysicalDeviceRobustness2FeaturesEXT robust2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+            bool hasR2=false;for(auto &e:extensions)if(!strcmp(e.extensionName,VK_EXT_ROBUSTNESS_2_EXTENSION_NAME))hasR2=true;
+            if(hasR2){VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};q.pNext=&robust2;vkGetPhysicalDeviceFeatures2(physical,&q);
+                if(robust2.nullDescriptor){deviceExt.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);robust2.pNext=chain;chain=&robust2;log("enabledRobustness2NullDescriptor=1");}}
+            /* 客体着色器大量使用 16 位打包数据：除 shaderFloat16 外还要开 16/8 位存储，
+             * 否则 vkCreateComputePipelines 会直接失败（实测 -1）。
+             * The guest shaders use 16-bit packed data heavily: besides shaderFloat16 they also need
+             * 16/8-bit storage, otherwise vkCreateComputePipelines fails outright (measured -1). */
+            bool hasS16=false;for(auto &e:extensions)if(!strcmp(e.extensionName,VK_KHR_16BIT_STORAGE_EXTENSION_NAME))hasS16=true;
+            s16Usable=hasS16&&s16.storageBuffer16BitAccess;
+            if(s16Usable){deviceExt.push_back(VK_KHR_16BIT_STORAGE_EXTENSION_NAME);s16.storageBuffer16BitAccess=VK_TRUE;s16.uniformAndStorageBuffer16BitAccess=VK_TRUE;s16.pNext=chain;chain=&s16;}
+            bool hasS8=false;for(auto &e:extensions)if(!strcmp(e.extensionName,VK_KHR_8BIT_STORAGE_EXTENSION_NAME))hasS8=true;
+            s8Usable=hasS8&&s8.storageBuffer8BitAccess;
+            if(s8Usable){deviceExt.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);s8.storageBuffer8BitAccess=VK_TRUE;s8.uniformAndStorageBuffer8BitAccess=VK_TRUE;s8.pNext=chain;chain=&s8;}
+            bool has16=false;for(auto &e:extensions)if(!strcmp(e.extensionName,VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME))has16=true;
+            float16Usable=has16&&float16.shaderFloat16;
+            if(float16Usable){deviceExt.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);float16.shaderFloat16=VK_TRUE;float16.pNext=chain;chain=&float16;log("enabledShaderFloat16=1");}
+            bool hasFault=false;for(auto &e:extensions)if(!strcmp(e.extensionName,VK_EXT_DEVICE_FAULT_EXTENSION_NAME))hasFault=true;
+            if(hasFault){VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};q.pNext=&faultFeatures;vkGetPhysicalDeviceFeatures2(physical,&q);faultFeatures.pNext=nullptr;
+                if(faultFeatures.deviceFault){deviceExt.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);faultFeatures.deviceFaultVendorBinary=VK_FALSE;faultFeatures.pNext=chain;chain=&faultFeatures;faultEnabled=true;log("enabledDeviceFault=1");}}
+            draw.pNext=chain;
+            dprintf(2, "[xbl-host] EXT-PROBE r2=%d nullDesc=%d f16=%d s16=%d s8=%d extCount=%zu\n",
+                (int)hasR2,(int)robust2.nullDescriptor,(int)float16Usable,(int)s16Usable,(int)s8Usable,extensions.size());
+        }
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};di.pNext=&draw;di.pEnabledFeatures=&enabled;di.queueCreateInfoCount=1;di.pQueueCreateInfos=&qi;di.enabledExtensionCount=static_cast<uint32_t>(deviceExt.size());di.ppEnabledExtensionNames=deviceExt.data();
 
         check(vkCreateDevice(physical,&di,nullptr,&device),"device");vkGetDeviceQueue(device,family,0,&queue);
@@ -708,6 +765,24 @@ struct Session {
         }
 
         if(released){char line[256];snprintf(line,sizeof(line),"wsiCollect frame=%llu proof=first-present-image-reacquired index=%u released=%u retained=%zu budgetGenerations=%u bytes=%llu",(unsigned long long)frames,acquiredIndex,released,retiredSwaps.size(),swapBudget.generations,swapBudget.imageByteLowerBound);log(line);}
+
+    }
+
+    VkSwapchainKHR drainRetiredSwaps(){
+
+        if(blitPending){check(vkWaitForFences(device,1,&done,VK_TRUE,5000000000ULL),"blit completion before swapchain drain");blitPending=false;}
+
+        check(vkQueueWaitIdle(queue),"queue idle before swapchain drain");
+
+        const size_t released=retiredSwaps.size();
+
+        for(auto &retired:retiredSwaps){for(auto semaphore:retired.semaphores)vkDestroySemaphore(device,semaphore,nullptr);vkDestroySwapchainKHR(device,retired.handle,nullptr);need(swapBudget.release(retired.bytes),"Swapchain retirement accounting invalid");}
+
+        retiredSwaps.clear();
+
+        char line[192];snprintf(line,sizeof(line),"wsiDrain frame=%llu released=%zu budgetGenerations=%u bytes=%llu",(unsigned long long)frames,released,swapBudget.generations,swapBudget.imageByteLowerBound);log(line);
+
+        return VK_NULL_HANDLE;
 
     }
 
@@ -818,6 +893,10 @@ struct Session {
         need(chosen.format!=VK_FORMAT_UNDEFINED,"No supported surface format");format=chosen.format;
 
         uint32_t imagesWanted=caps.minImageCount+1;if(caps.maxImageCount)imagesWanted=std::min(imagesWanted,caps.maxImageCount);need(imagesWanted<=8,"Too many swapchain images");
+
+        // Fold/unfold produces several resizes before the newest chain's first present can prove the
+        // retired chains idle; drain the queue and drop them rather than abort on the budget.
+        if(!swapBudget.allows(extent.width,extent.height,imagesWanted))old=drainRetiredSwaps();
 
         need(swapBudget.allows(extent.width,extent.height,imagesWanted),"Swapchain recovery budget exhausted; restart application (image bytes are a lower bound)");
 
@@ -1003,9 +1082,36 @@ struct Session {
 
 Session *session=nullptr;
 
-int Present(void *u,void *,VkImage image,VkFormat f,uint32_t w,uint32_t h,const int32_t crop[4],int32_t interval){auto *s=static_cast<Session*>(u);s->perfEnter(w,h,interval);const int rc=s->present(image,f,w,h,crop,interval);s->perfLeave(rc);s->pollCpuProfile();s->pollProvenance();return rc;}
+// The game asks for interval 2 (30 fps). Like the iOS host's "display" interval mode, present every 60 Hz tick:
+// game logic runs on its own 25 Hz tick and its frame-counted UI was verified unchanged on iOS.
+// files/fps-30 restores the game's requested interval.
+int Present(void *u,void *,VkImage image,VkFormat f,uint32_t w,uint32_t h,const int32_t crop[4],int32_t interval){auto *s=static_cast<Session*>(u);
+    {static int keep=-1;if(keep<0){keep=access((s->logPath.substr(0,s->logPath.find_last_of('/'))+"/fps-30").c_str(),F_OK)==0;s->log(keep?"presentInterval=game (fps-30)":"presentInterval=display (60 Hz)");}if(!keep&&interval>1)interval=1;}
+    if(s->frames%60==0)XblCpuSamplerPoll(s->logPath.substr(0,s->logPath.find_last_of('/')).c_str());
+    s->perfEnter(w,h,interval);const int rc=s->present(image,f,w,h,crop,interval);s->perfLeave(rc);s->pollCpuProfile();s->pollProvenance();return rc;}
 
-void Log(void *u,const char *message){if(!message)return;if(XblGraphicsFatal(message)){static_cast<Session*>(u)->log(message);return;}if(static_cast<Session*>(u)->receiveCpuLog(message))return;if(GameDiagnosticsEnabled()||strstr(message,"NVN PERF")||strstr(message,"NVN TEXBUF")||strstr(message,"NVN async")||strstr(message,"NVN caps")||strstr(message,"NVN CPUGPU")||strstr(message,"NVN COPYT2T")||strstr(message,"NVN ASTC2BC")||strstr(message,"NVN wtrack")||strstr(message,"NVN GPASS")||strstr(message,"NVN warm")||strstr(message,"NVN noload")||strstr(message,"NVN NULLTEX")||strstr(message,"NVN pipeline cache")||strstr(message,"PROVENANCE_CLOSE")||strstr(message,"failed")||strstr(message,"FAIL")||strstr(message,"error"))static_cast<Session*>(u)->log(message);}
+constexpr const char *kKeptGraphicsLog[]={"NVN PERF","NVN TEXBUF","NVN async","NVN caps","NVN CPUGPU","NVN COPYT2T","NVN SUBMIT_TRACE","NVN ASTC2BC","NVN wtrack","NVN GPASS","NVN warm","NVN noload","NVN NULLTEX","NVN pipeline cache","PROVENANCE_CLOSE","failed","FAIL","error"};
+bool KeptGraphicsLog(const char *text){for(const char *k:kKeptGraphicsLog)if(strstr(text,k))return true;return false;}
+void Log(void *u,const char *message){if(!message)return;if(XblGraphicsFatal(message)){static_cast<Session*>(u)->log(message);return;}if(static_cast<Session*>(u)->receiveCpuLog(message))return;if(GameDiagnosticsEnabled()||KeptGraphicsLog(message))static_cast<Session*>(u)->log(message);}
+// Decides from the format string alone; a bare "%s" may carry FATAL or a kept keyword.
+// Per-pass formats such as "NVN framebuffer mode=%s" must not pass just for containing "%s".
+int LogWantedUncached(const char *format){
+    if(!strcmp(format,"%s")||strstr(format,"FATAL")||!strncmp(format,"NVN CPU_TIMING",14)||!strncmp(format,"NVN DESC_TIMING",15)||!strncmp(format,"NVN DRAW_TIMING",15))return 1;
+    return KeptGraphicsLog(format)?1:0;
+}
+// Formats are string literals, so the decision is cached per address: ~125 calls per frame would
+// otherwise each run ~20 strstr scans over long format strings. Entry = address<<1 | wanted.
+int LogWanted(void *,const char *format){
+    if(!format||GameDiagnosticsEnabled())return 1;
+    static std::atomic<uintptr_t> cache[256];
+    const uintptr_t p=reinterpret_cast<uintptr_t>(format);
+    std::atomic<uintptr_t> &slot=cache[((p>>3)^(p>>11))&255];
+    const uintptr_t e=slot.load(std::memory_order_relaxed);
+    if((e>>1)==p)return int(e&1);
+    const int wanted=LogWantedUncached(format);
+    slot.store(p<<1|uintptr_t(wanted),std::memory_order_relaxed);
+    return wanted;
+}
 
 }
 
@@ -1019,7 +1125,7 @@ bool InitializeGameGraphics(const std::string &files,GuestInvoke invoke,GuestFat
 
     session=new Session;session->shaderPath=files+"/game-shaders";session->logPath=files+"/game-graphics.txt";session->provenanceMarker=files+"/gfx-provenance-once";session->provenanceBase=files+"/gfx-provenance-";
 
-    try{session->init();xbg_game_config config{};config.size=sizeof(config);config.physical=session->physical;config.device=session->device;config.queue=session->queue;config.queue_family=session->family;config.enabled_core=session->enabled;config.enabled_shader_draw_parameters=session->drawParameters;config.fence_timeout_ns=5000000000ULL;config.shader_directory=session->shaderPath.c_str();config.userdata=session;config.invoke_guest=invoke;config.fatal=fatal;config.present=Present;config.log=Log;char error[1024]{};int rc=xbg_game_initialize(&config,error,sizeof(error));if(rc)throw std::runtime_error(error);if(xbg_game_set_sampler_mirror_clamp_to_edge(session->mirrorClampEnabled?VK_TRUE:VK_FALSE)!=0)throw std::runtime_error("Sampler capability registration failed");report="gameGraphics=READY";session->log(report.c_str());return true;}catch(const std::exception &e){report=e.what();session->log(report.c_str());return false;}
+    try{session->init();xbg_game_config config{};config.size=sizeof(config);config.physical=session->physical;config.device=session->device;config.queue=session->queue;config.queue_family=session->family;config.enabled_core=session->enabled;config.enabled_shader_draw_parameters=session->drawParameters;config.enabled_shader_float16=session->float16Usable?VK_TRUE:VK_FALSE;config.fence_timeout_ns=5000000000ULL;config.shader_directory=session->shaderPath.c_str();config.userdata=session;config.invoke_guest=invoke;config.fatal=fatal;config.present=Present;config.log=Log;config.log_wanted=LogWanted;char error[1024]{};int rc=xbg_game_initialize(&config,error,sizeof(error));if(rc)throw std::runtime_error(error);if(xbg_game_set_sampler_mirror_clamp_to_edge(session->mirrorClampEnabled?VK_TRUE:VK_FALSE)!=0)throw std::runtime_error("Sampler capability registration failed");report="gameGraphics=READY";session->log(report.c_str());return true;}catch(const std::exception &e){report=e.what();session->log(report.c_str());return false;}
 
 #else
 

@@ -16,7 +16,8 @@ struct XbgPipelineKey {
     void q(uint64_t n){u(uint32_t(n));u(uint32_t(n>>32));}
     void f(float n){uint32_t bits;memcpy(&bits,&n,4);u(bits);}
     XbgPipelineKeyView view()const{return {words,count,valid};}
-    void piece(XbgPipelineKeyView p){u(p.count);if(!p.valid)valid=false;for(uint32_t i=0;i<p.count;i++)u(p.words[i]);}
+    void piece(XbgPipelineKeyView p){u(p.count);if(!p.valid)valid=false;
+        if(p.count<=Capacity-count){memcpy(words+count,p.words,size_t(p.count)*4);count+=p.count;}else{count=Capacity;valid=false;}}
     bool same(const XbgPipelineKey &p)const{return valid && p.valid && count==p.count && !memcmp(words,p.words,size_t(count)*4);}
 };
 

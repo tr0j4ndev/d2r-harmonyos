@@ -29,7 +29,7 @@ HLE_FORCE("_ZN2nn7friends29GetPlayHistoryRegistrationKeyEPNS0_26PlayHistoryRegis
 HLE_FORCE("_ZN2nn7friends17NotificationQueueC1Ev", "通知队列不建会话（剪）", void, h_fr_NqCtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn7friends17NotificationQueueD1Ev", "通知队列无会话可关（剪）", void, h_fr_NqDtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE", "通知队列初始化失败（剪）", Result, h_fr_NqInit, void *self, const void *uid) { (void)self; (void)uid; return RES_FAIL; }
-HLE_FORCE("_ZN2nn7friends17NotificationQueue14GetSystemEventEv", "通知事件永不触发（剪）", void *, h_fr_NqGetEv, void *self) { (void)self; return quiet_event(g_ev_notify); }
+HLE_FORCE("_ZN2nn7friends17NotificationQueue14GetSystemEventEv", "通知事件永不触发（剪）", void *, h_fr_NqGetEv, void *self) { (void)self; void *e=quiet_event(g_ev_notify); xblr_hle_note("friends notification event=%p", e); return e; }
 HLE_FORCE("_ZN2nn7friends17NotificationQueue3PopEPNS0_16NotificationInfoE", "通知队列恒空（剪）", Result, h_fr_NqPop, void *self, void *info) { (void)self; (void)info; return RES_FAIL; }
 // 邀请
 HLE_FORCE("_ZN2nn7friends36GetFriendInvitationNotificationEventEv", "邀请通知事件永不触发（剪）", void *, h_fr_InvEv, void) { return quiet_event(g_ev_invite); }

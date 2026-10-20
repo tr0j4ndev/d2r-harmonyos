@@ -358,6 +358,7 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     if (S_ISDIR(st.st_mode)) { close(fd); return RES_PATH_NOT_FOUND; }
     if (fd >= (int)sizeof g_fmode) die("fd 超出表");
     g_fmode[fd] = (uint8_t)mode; *out = (uint64_t)fd;
+    xblr_hle_note("open %s mode=%d fd=%d", path, mode, fd);
     if(fd>=4096) {close(fd);errno=EMFILE;return RES_FAIL;} g_hm[fd] = NULL; if (!(mode & (MODE_WRITE | MODE_APPEND))) sw_data_note_fd(fd, hp);
     { const char *c = strchr(path, ':'); size_t ln = c ? (size_t)(c - path) : 0; g_fsave[fd] = 0;
       for (int i = 0; c && i < g_nmnt; i++) if (strlen(g_mnt[i].name) == ln && !strncmp(g_mnt[i].name, path, ln)) g_fsave[fd] = g_mnt[i].commit[0] != 0; }
@@ -376,6 +377,7 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
         got += r;
     }
     *out = got;
+    xblr_hle_note("read fd=%llu off=%lld want=%zu got=%zu", (unsigned long long)h, (long long)off, sz, got);
     if (g_flag.bootprof) sw_prof_add(PROF_FS_READ, now_ns() - t0, got);
     if (g_fslog) { pthread_mutex_lock(&g_fslog_lock);
         static int hash_on = -1; if (hash_on < 0) hash_on = getenv("SW_FSLOG_HASH") != NULL;   // SW_FSLOG_HASH=1：末尾加一列读到内容的 FNV-1a 64（对比两份资源包读到的字节是否一致）
@@ -413,7 +415,8 @@ HLE_FORCE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "fsp
 }
 HLE_FORCE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", "fsp-srv → fstat(2)", Result, h_fs_GetFileSize, int64_t *out, uint64_t h) {
     struct stat st; if (fstat((int)h, &st)) return err_res("fstat", "fd");
-    *out = (int)h < 4096 && g_hm[(int)h] ? g_hm[(int)h]->size : st.st_size; return RES_OK;
+    *out = (int)h < 4096 && g_hm[(int)h] ? g_hm[(int)h]->size : st.st_size;
+    xblr_hle_note("filesize fd=%llu size=%lld", (unsigned long long)h, (long long)*out); return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", "fsp-srv → ftruncate(2)", Result, h_fs_SetFileSize, uint64_t h, int64_t sz) {
     if (!ftruncate((int)h, sz)) return RES_OK;
@@ -522,7 +525,7 @@ HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → o
 }
 HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", "fsp-srv → readdir(3)", Result, h_fs_ReadDirectory, int64_t *count, DirectoryEntry *ents, uint64_t hh, int64_t max) {
     PATH_LOCK(); dirh_t *h = (dirh_t *)hh; int64_t n = 0; struct dirent *e;
-    if (h->snap) { while (n < max && h->psnap < h->nsnap) { DirectoryEntry *src = &h->snap[h->psnap++]; if (!(h->mode & (src->type == ENT_DIR ? DIRMODE_DIR : DIRMODE_FILE))) continue; ents[n++] = *src; } *count = n; return RES_OK; }
+    if (h->snap) { while (n < max && h->psnap < h->nsnap) { DirectoryEntry *src = &h->snap[h->psnap++]; if (!(h->mode & (src->type == ENT_DIR ? DIRMODE_DIR : DIRMODE_FILE))) continue; ents[n++] = *src; } *count = n; xblr_hle_note("readdir(snap) count=%lld first=%s", (long long)n, n>0?ents[0].name:"(none)"); return RES_OK; }
     while (n < max && (e = readdir(h->d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         { size_t dl = strlen(e->d_name); if (dl > 6 && !strcmp(e->d_name + dl - 6, ".holes")) continue; }   // 区段表不给游戏看
@@ -534,7 +537,9 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
         if (!guest_name(h->path, e->d_name, o->name, sizeof o->name)) { *count = n - 1; return err_res("directory name", c); }
         o->type = isdir ? ENT_DIR : ENT_FILE; o->size = isdir ? 0 : sw_data_logical_size(c, st.st_size);
     }
-    *count = n; return RES_OK;
+    *count = n;
+    xblr_hle_note("readdir mode=%d count=%lld first=%s", h->mode, (long long)n, n>0?ents[0].name:"(none)");
+    return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → closedir(3)", void, h_fs_CloseDirectory, uint64_t hh) {
     dirh_t *h = (dirh_t *)hh; closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h);

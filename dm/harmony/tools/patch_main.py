@@ -35,7 +35,10 @@ def apply(generated):
     marker='// claude widescreen relocs\n'
     if marker not in s:
         k=s.index('.global xblr_main_s0')
-        s=s[:k]+marker+''.join(f'.reloc xblr_main_base+{o}, {ty}, {sym}\n' for o,ty,sym in relocs)+s[k:]
+        # LLVM 15's assembler silently emits a symbol-less (address 0) relocation when the
+        # .reloc target is never declared in this file; the adrp/ldr pairs then read the ELF header.
+        decl=''.join(f'.hidden {sym}\n' for sym in sorted({sym for _,_,sym in relocs}))
+        s=s[:k]+marker+decl+''.join(f'.reloc xblr_main_base+{o}, {ty}, {sym}\n' for o,ty,sym in relocs)+s[k:]
     open(generated / 'harmony_images.S','w',encoding='utf-8').write(s)
 
     # 512MB显存与1024阴影是当前历史候选的有界替换。 | Guarded 512MB VRAM and 1024 shadow replacements from the historical candidate.

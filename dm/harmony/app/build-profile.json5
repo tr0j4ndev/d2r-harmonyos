@@ -4,9 +4,10 @@
     "products": [
       {
         "name": "default",
+        "compileSdkVersion": "26.0.0",
         "targetSdkVersion": "26.0.0",
         "compatibleSdkVersion": "26.0.0",
-        "runtimeOS": "HarmonyOS",
+        "runtimeOS": "OpenHarmony",
         "buildOption": {
           "strictMode": {
             "caseSensitiveCheck": true,
@@ -16,10 +17,11 @@
       },
       {
         "name": "release",
+        "compileSdkVersion": "26.0.0",
         "bundleName": "com.xiao.boluo",
         "targetSdkVersion": "26.0.0",
         "compatibleSdkVersion": "26.0.0",
-        "runtimeOS": "HarmonyOS",
+        "runtimeOS": "OpenHarmony",
         "buildOption": {
           "strictMode": {
             "caseSensitiveCheck": true,

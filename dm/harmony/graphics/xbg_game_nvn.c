@@ -1,13 +1,14 @@
 /* Portable original-NVN interface. Semantic implementation is derived from
  * gfx/nvn/hle_nvn.c; platform Metal/profiling/no-op fallbacks are not included. */
 #include "xbg_game_internal.h"
+#include <sys/mman.h>   // mincore：读之前先确认页已映射 | mincore: prove a page is mapped before reading it
 #include "../compat-r32/gfx/nvn/nvn_protos.h"
 #include <stdatomic.h>
 #include <stddef.h>
 #define LOG xbg_logf
 #define die xbg_fatalf
 #define OLOG(...) ((void)0)
-#define NVN(name,ret,...) static ret h_##name(__VA_ARGS__); \
+#define NVN(name,ret,...) static ret h_##name(__VA_ARGS__) __attribute__((used)); \
  static const NVNT_##name chk_##name __attribute__((unused))=h_##name; \
  static ret h_##name(__VA_ARGS__)
 #define NVN_NOPROTO(name,ret,...) static ret h_##name(__VA_ARGS__)
@@ -104,8 +105,55 @@ NVN(nvnTextureBuilderSetDefaults, void, NVNtextureBuilder *b) {
 NVN(nvnTextureBuilderSetDevice, void, NVNtextureBuilder *b, NVNdevice *d) { TB(b)->dev = d; }
 NVN(nvnTextureBuilderSetFlags, void, NVNtextureBuilder *b, int f) { TB(b)->d.flags = f; }
 NVN(nvnTextureBuilderSetTarget, void, NVNtextureBuilder *b, NVNtextureTarget t) { TB(b)->d.target = t; }
-NVN(nvnTextureBuilderSetWidth, void, NVNtextureBuilder *b, int v) { TB(b)->d.width = v; }
-NVN(nvnTextureBuilderSetHeight, void, NVNtextureBuilder *b, int v) { TB(b)->d.height = v; }
+/* 寄存器捕获跳板：nvnTextureBuilderSetWidth 是 NVN 入口（不是 HLE 服务），HLE 跳板看不到它。
+ * 客体直接调它，所以进来时 x19–x28 仍是客体的值 —— 记下它们就能看见「游戏从哪个对象/指针
+ * 取到这个宽度」。实测宽度是 0x464C457F（ELF e_ident 的前 4 字节）。
+ * Register-capture trampoline: nvnTextureBuilderSetWidth is an NVN entry point (not an HLE service), so
+ * the HLE trampoline never sees it. The guest calls it directly, so on entry x19-x28 still hold the
+ * guest's values - recording them shows which object/pointer the game took the width from. The measured
+ * width is 0x464C457F, the first four bytes of an ELF e_ident. */
+static void h_nvnTextureBuilderSetWidth(NVNtextureBuilder *b, int v);
+void xbg_tex_width_regs(unsigned long x19, unsigned long x20, unsigned long x21,
+                        unsigned long x0, unsigned long x1, unsigned long lr);
+__attribute__((naked)) static void h_nvnTextureBuilderSetWidth_cap(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x60\n\t"
+        "stp x0, x1, [sp, #0x00]\n\t"
+        "stp x19, x20, [sp, #0x20]\n\t"
+        "stp x21, x30, [sp, #0x30]\n\t"
+        "ldp x0, x1, [sp, #0x20]\n\t"   /* x0=x19, x1=x20 */
+        "mov x2, x21\n\t"                /* x2=x21 (saved copy below) */
+        "ldr x3, [sp, #0x00]\n\t"        /* x3=原始 x0 (builder) */
+        "ldr x4, [sp, #0x08]\n\t"        /* x4=原始 x1 (宽度值) */
+        "ldr x5, [sp, #0x38]\n\t"        /* x5=返回地址 */
+        "bl xbg_tex_width_regs\n\t"
+        "ldp x0, x1, [sp, #0x00]\n\t"
+        "ldp x19, x20, [sp, #0x20]\n\t"
+        "ldp x21, x30, [sp, #0x30]\n\t"
+        "add sp, sp, #0x60\n\t"
+        "b h_nvnTextureBuilderSetWidth\n\t");
+}
+void xbg_tex_width_regs(unsigned long x19, unsigned long x20, unsigned long x21,
+                        unsigned long x0, unsigned long x1, unsigned long lr) {
+    dprintf(2, "[nvn-reg] SetWidth builder=%#lx w=%u | x19=%#lx x20=%#lx x21=%#lx lr=%#lx\n",
+        x0, (unsigned)x1, x19, x20, x21, lr);
+}
+NVN(nvnTextureBuilderSetWidth, void, NVNtextureBuilder *b, int v) {
+    /* 只记值，不解引用客体给的指针（实测客体偶尔传来小整数，解引用会野访崩掉）。
+     * Only log the value; never dereference a guest-supplied pointer (the guest has been seen passing
+     * small integers, and dereferencing those crashed the port). */
+    dprintf(2, "[nvn-tex] SetWidth b=%p w=%d\n", (void *)b, v);
+    if (v < 0 || v > 16384) {
+        dprintf(2, "[nvn-tex] WIDTH-OOB %d -> game default 1280\n", v);
+        v = 1280;
+    }
+    TB(b)->d.width = v; }
+NVN(nvnTextureBuilderSetHeight, void, NVNtextureBuilder *b, int v) {
+    if (v <= 0 || v > 16384) {
+        dprintf(2, "[nvn-tex] 高度越界 %d → 按未设置处理，用游戏自己的默认值 720\n", v);
+        v = 720;
+    }
+    TB(b)->d.height = v; }
 NVN(nvnTextureBuilderSetDepth, void, NVNtextureBuilder *b, int v) { TB(b)->d.depth = v; }
 NVN(nvnTextureBuilderSetSize1D, void, NVNtextureBuilder *b, int w) { TB(b)->d.width = w; TB(b)->d.height = TB(b)->d.depth = 1; }
 NVN(nvnTextureBuilderSetLevels, void, NVNtextureBuilder *b, int v) { TB(b)->d.levels = v; }
@@ -127,8 +175,11 @@ static void log_layout(const tex_builder_t *b, const nvn_texlayout *L) {
 }
 NVN(nvnTextureBuilderGetStorageSize, size_t, const NVNtextureBuilder *b) {
     nvn_texlayout L; nvn_tex_layout(&((const tex_builder_t *)b)->d, &L);
-    if (!L.bpb) LOG("【红】TextureBuilderGetStorageSize 未知格式 %#x", ((const tex_builder_t *)b)->d.format);
-    log_layout((const tex_builder_t *)b, &L);
+    dprintf(2, "[nvn-tex] GetStorageSize target=%u fmt=%#x %ux%ux%u -> size=%llu align=%llu\n",
+        ((const tex_builder_t *)b)->d.target, ((const tex_builder_t *)b)->d.format,
+        ((const tex_builder_t *)b)->d.width, ((const tex_builder_t *)b)->d.height,
+        ((const tex_builder_t *)b)->d.depth,
+        (unsigned long long)L.size, (unsigned long long)L.align);
     return L.size;
 }
 NVN(nvnTextureBuilderGetStorageAlignment, size_t, const NVNtextureBuilder *b) {
@@ -928,6 +979,7 @@ static void unsupported_nvnDeviceSetAutomaticCheckpointsByDebugGroup(void) { xbg
 static void unsupported_nvnDeviceSetCheckpointCallStacksEnable(void) { xbg_fatalf("NVN API called but not implemented: nvnDeviceSetCheckpointCallStacksEnable"); }
 static void unsupported_nvnDeviceSetCheckpointMaxCallStacksDepth(void) { xbg_fatalf("NVN API called but not implemented: nvnDeviceSetCheckpointMaxCallStacksDepth"); }
 void *xbg_nvn_get_proc_address(const char *name) {
+    extern void xbg_trace_install(void); xbg_trace_install();   // NVN 调用追踪（xbg_nvn_trace.c）
  if (!name) { xbg_logf("NVN null proc name"); return NULL; }
  if (!strcmp(name,"nvnDeviceBuilderSetDefaults")) return (void *)h_nvnDeviceBuilderSetDefaults;
  if (!strcmp(name,"nvnDeviceBuilderSetFlags")) return (void *)h_nvnDeviceBuilderSetFlags;

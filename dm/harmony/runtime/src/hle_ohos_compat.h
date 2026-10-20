@@ -74,14 +74,58 @@ const char *xblr_romfs_name(const char *parent,const char *physical_name);
 int xblr_romfs_is_root(const char *hostpath,const char *guestpath);
 int xblr_fs_guest_name_matches(const char *hostpath,const char *guestpath);
 int xblr_graphics_configured(void);
+/* HLE 调用跳板：把绑定地址从服务函数换成尾调用跳板——记下服务名（存进环形缓冲，崩时 dump）
+ * 再 b 回真函数。为什么要生成汇编：服务签名各不相同（含 void 返回、浮点参数），
+ * 用 C 包装器无法通吃；跳板保存所有参数寄存器（含 q0–q7）再尾跳，任何签名都成立。
+ * HLE call trampoline: the binding points at a trampoline that records the service name into a ring
+ * buffer and tail-calls the real function. It has to be assembly: the services have different
+ * signatures (void returns, float args), which no single C wrapper can forward; saving all argument
+ * registers (including q0-q7) and tail-jumping works for every signature. */
+#define HLE_TRAMPOLINE(cname,mangled) \
+    static const char cname##_tracename[] __attribute__((used)) = mangled; \
+    __attribute__((naked,used)) static void cname##_tramp(void) { \
+        __asm__ volatile( \
+            "sub sp, sp, #0xE0\n\t" \
+            "stp x0, x1, [sp, #0x00]\n\t" \
+            "stp x2, x3, [sp, #0x10]\n\t" \
+            "stp x4, x5, [sp, #0x20]\n\t" \
+            "stp x6, x7, [sp, #0x30]\n\t" \
+            "stp x8, x30, [sp, #0x40]\n\t" \
+            "stp q0, q1, [sp, #0x50]\n\t" \
+            "stp q2, q3, [sp, #0x70]\n\t" \
+            "stp q4, q5, [sp, #0x90]\n\t" \
+            "stp q6, q7, [sp, #0xB0]\n\t" \
+            "adrp x0, " #cname "_tracename\n\t" \
+            "add x0, x0, :lo12:" #cname "_tracename\n\t" \
+            "bl xblr_hle_trace\n\t" \
+            "mov x0, sp\n\t" \
+            "sub x0, x0, #0x100\n\t" \
+            "mov w1, #0x10000\n\t" \
+            "bl xblr_hle_scrub\n\t" \
+            "ldp q6, q7, [sp, #0xB0]\n\t" \
+            "ldp q4, q5, [sp, #0x90]\n\t" \
+            "ldp q2, q3, [sp, #0x70]\n\t" \
+            "ldp q0, q1, [sp, #0x50]\n\t" \
+            "ldp x8, x30, [sp, #0x40]\n\t" \
+            "ldp x6, x7, [sp, #0x30]\n\t" \
+            "ldp x4, x5, [sp, #0x20]\n\t" \
+            "ldp x2, x3, [sp, #0x10]\n\t" \
+            "ldp x0, x1, [sp, #0x00]\n\t" \
+            "add sp, sp, #0xE0\n\t" \
+            "b " #cname "\n\t"); \
+    }
+void xblr_hle_trace(const char *name);
+void xblr_hle_note(const char *fmt, ...) __attribute__((format(printf,1,2)));
 #define HLE(mangled,ret,cname,...) \
-    static ret cname(__VA_ARGS__); \
+    static ret cname(__VA_ARGS__) __attribute__((used)); \
+    HLE_TRAMPOLINE(cname,mangled) \
     __attribute__((used,section("xblr_hle"),aligned(8))) \
-    static const xblr_hle_binding xblr_hle_##cname={mangled,(uintptr_t)cname,0}; \
+    static const xblr_hle_binding xblr_hle_##cname={mangled,(uintptr_t)cname##_tramp,0}; \
     static ret cname(__VA_ARGS__)
 #define HLE_FORCE(mangled,why,ret,cname,...) \
-    static ret cname(__VA_ARGS__); \
+    static ret cname(__VA_ARGS__) __attribute__((used)); \
+    HLE_TRAMPOLINE(cname,mangled) \
     __attribute__((used,section("xblr_hle"),aligned(8))) \
-    static const xblr_hle_binding xblr_hle_##cname={mangled,(uintptr_t)cname,1}; \
+    static const xblr_hle_binding xblr_hle_##cname={mangled,(uintptr_t)cname##_tramp,1}; \
     static ret cname(__VA_ARGS__)
 #endif

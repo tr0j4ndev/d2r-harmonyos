@@ -96,6 +96,11 @@ static class SwshXlate
         // 作业 reduced = true：放宽精度——翻译器只给强制精确的运算打 NoContraction（缺省全部打：保持 Maxwell 分开舍入的逐位结果，代价是 MSL 里大量禁优化的 spvFMul 等）
         // Job reduced = true: relaxed precision - the translator marks NoContraction only on operations that must be exact (the default marks all: keeps the bit-exact results of Maxwell's separate rounding, at the cost of many optimization-disabled spvFMul etc. in the MSL)
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;
+        // 作业 host：按目标真机作答（如鸿蒙 Maleoon 驱动拒收 Float64 能力；鸿蒙校验器不接受任何 OpExtension）；缺省维持 Metal 路线的原答案
+        // Job host: answer for the real target device (e.g. the Maleoon driver rejects the Float64 capability; the Harmony validator accepts no OpExtension); default keeps the Metal route's original answers
+        bool Host(string name) => !(_job["host"] is JsonObject h && h[name] is JsonNode n) || (bool)n;
+        public bool QueryHostSupportsShaderFloat64() => Host("float64");
+        public bool QueryHostSupportsFragmentShaderInterlock() => Host("interlock");
     }
 
     static int Main(string[] args)

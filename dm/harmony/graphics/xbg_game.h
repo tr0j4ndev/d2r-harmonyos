@@ -17,6 +17,9 @@ typedef struct xbg_game_config {
     uint32_t queue_family;
     VkPhysicalDeviceFeatures enabled_core;
     VkBool32 enabled_shader_draw_parameters;
+    /* Float16 不在 VkPhysicalDeviceFeatures 里，它来自扩展 VK_KHR_shader_float16_int8。
+     * Float16 is not part of VkPhysicalDeviceFeatures; it comes from VK_KHR_shader_float16_int8. */
+    VkBool32 enabled_shader_float16;
     uint64_t fence_timeout_ns;
     const char *shader_directory; /* <control-sha256-first16>.xgs bundles */
     void *userdata;
@@ -32,6 +35,9 @@ typedef struct xbg_game_config {
     /* Called immediately before abort for unsupported called APIs/GPU errors.
      * May terminate/unwind the runtime. It must not return to guest execution. */
     void (*fatal)(void *userdata,const char *message);
+    /* Optional: return 0 when log() would discard every message produced from this
+     * format string, so the graphics thread skips formatting it. NULL keeps all. */
+    int (*log_wanted)(void *userdata,const char *format);
 } xbg_game_config;
 
 int xbg_game_initialize(const xbg_game_config *config,char *error,size_t error_bytes);

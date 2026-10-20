@@ -7,6 +7,7 @@
 #include "game_keyboard.h"
 #include "gpu_checks.h"
 #include <pthread.h>
+#include <sys/stat.h>   // fchmod：让原生日志世界可读 | fchmod: make the native log world-readable
 #include <dlfcn.h>
 #include <cstdio>
 #include <cstring>
@@ -48,8 +49,8 @@ void *Thread(void *data){
     auto &w=*static_cast<Work *>(data);std::ostringstream out;
     const auto epoch=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     Save(w,"\nSESSION pid="+std::to_string(getpid())+" epoch_ms="+std::to_string(epoch)+"\n");
-    int logfd=open((w.path+"/runtime-native.txt").c_str(),O_CREAT|O_WRONLY|O_APPEND,0600);
-    if(logfd>=0){fflush(stderr);fflush(stdout);dup2(logfd,STDERR_FILENO);dup2(logfd,STDOUT_FILENO);close(logfd);setvbuf(stderr,nullptr,_IONBF,0);setvbuf(stdout,nullptr,_IONBF,0);}
+    int logfd=open((w.path+"/runtime-native.txt").c_str(),O_CREAT|O_WRONLY|O_APPEND,0666);   // 0666: 诊断要能被 hdc 读到 | world-readable so hdc can read diagnostics
+    if(logfd>=0){fchmod(logfd,0666);fflush(stderr);fflush(stdout);dup2(logfd,STDERR_FILENO);dup2(logfd,STDOUT_FILENO);close(logfd);setvbuf(stderr,nullptr,_IONBF,0);setvbuf(stdout,nullptr,_IONBF,0);}
     fprintf(stderr,"[frontend] SESSION pid=%d epoch_ms=%lld stage=%u\n",getpid(),static_cast<long long>(epoch),w.stage);
     Save(w,"runtime startup worker entered; requestedStage="+std::to_string(w.stage)+" maxGates="+std::to_string(w.maxGates)+" stackBytes=4194304\n");
 #ifdef XBL_RUNTIME_EXECUTION

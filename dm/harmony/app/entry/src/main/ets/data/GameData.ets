@@ -1,5 +1,6 @@
 import { fileIo as fs, hash as fileHash, fileUri, picker, statfs as statvfs } from '@kit.CoreFileKit';
 import { common, appRecovery } from '@kit.AbilityKit';
+import { resourceManager } from '@kit.LocalizationKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { RESOURCE_FILES, ResourceEntry } from './ResourceManifest';
 import { ImportCommitIo, commitVerifiedImport } from './ImportCommit';
@@ -55,8 +56,62 @@ export class GameData {
     appRecovery.setRestartWant({bundleName:'com.xiaoboluo.harmony.bootstrap',abilityName:'EntryAbility'});
     appRecovery.restartApp();
   }
+  // 资料随 HAP 一起装，从应用自己的 rawfile 搬进 incoming/，之后由 check() 照常核 size+sha256。
+  // 为什么走这条路：主机侧没有别的通道能把文件送进应用沙箱 —— shell 进不去 files/，用户存储 shell 也写不了，
+  // 而 /data/local/tmp 会被 SELinux 挡住（实测应用里可见=0）。应用读自己的资源不受限制。
+  // shortcut: the 24 game files ship inside the HAP's rawfile so the app can stage them without a manual file-picker
+  // transfer; check() still enforces size+sha256, so a bad copy still fails the gate.
+  // Drop this once the player's own picker transfer is the only path needed.
+  // 资料分成两半随两个 HAP 一起装（一个 HAP 超 4 GB 就签不了名）：entry 的 rawfile/d2r 与 data1 的 rawfile/d2r1。
+  private async rawFileDescriptor(name: string): Promise<resourceManager.RawFileDescriptor | undefined> {
+    const managers: resourceManager.ResourceManager[]=[this.context.resourceManager];
+    try { managers.push(this.context.createModuleContext('data1').resourceManager); } catch (_) {}
+    for(const manager of managers) {
+      for(const dir of ['d2r','d2r1']) {
+        try { return await manager.getRawFd(dir+'/'+name); } catch (_) {}
+      }
+    }
+    return undefined;
+  }
+  private async absorbBundledSource(progress: (message: string)=>void): Promise<void> {
+    const incoming=this.context.filesDir+'/incoming';
+    for(const item of RESOURCE_FILES) {
+      this.ensureActive();
+      const staged=incoming+'/'+item.name;
+      if(await fs.access(staged)) {continue;}
+      const raw=await this.rawFileDescriptor(item.name);
+      if(raw===undefined) {continue;}
+      if(raw.length!==item.bytes) {
+        hilog.warn(0,'XblImport','bundled size mismatch %{public}s have=%{public}d want=%{public}d',item.name,raw.length,item.bytes);
+        continue;
+      }
+      progress(`正在导入 ${item.name}`);
+      hilog.info(0,'XblImport','bundled staged %{public}s bytes=%{public}d',item.name,item.bytes);
+      const partial=staged+'.partial';
+      const output=await fs.open(partial,fs.OpenMode.CREATE|fs.OpenMode.READ_WRITE|fs.OpenMode.TRUNC);
+      try {
+        const buffer=new ArrayBuffer(1048576);let copied=0;
+        while(copied<item.bytes) {
+          const want=Math.min(buffer.byteLength,item.bytes-copied);
+          const count=await fs.read(raw.fd,buffer,{offset:raw.offset+copied,length:want});
+          if(count<=0) {throw new Error(`读取内置资料中断：${item.name}`);}
+          let written=0;
+          while(written<count) {
+            const bytes=await fs.write(output.fd,buffer.slice(written,count));
+            if(bytes<=0) {throw new Error(`写入中断：${item.name}`);}
+            written+=bytes;
+          }
+          copied+=count;
+        }
+        await fs.fsync(output.fd);
+      } finally {await fs.close(output);}
+      await fs.rename(partial,staged);
+    }
+  }
   async check(progress: (message: string)=>void,full: boolean=false): Promise<GamePaths> {
-    const paths=await this.initialize();let previous: Receipt={files:[]};
+    const paths=await this.initialize();
+    await this.absorbBundledSource(progress);
+    let previous: Receipt={files:[]};
     const receiptPath=this.context.filesDir+'/data-receipt.json';
     if(await fs.access(receiptPath)) {try {previous=JSON.parse(await fs.readText(receiptPath)) as Receipt;} catch (_) {previous={files:[]};}}
     const next: Receipt={files:[]};
@@ -171,7 +226,7 @@ export class GameData {
     const manifestPath=root+'/manifest.json';
     if(!await fs.access(manifestPath)) {throw new Error('图形库尚未部署完成，请等待开发端更新；无需重新导入游戏资料。');}
     const items=JSON.parse(await fs.readText(manifestPath)) as ShaderEntry[];
-    if(items.length!==6927) {throw new Error('图形库清单不完整。');}
+    if(items.length!==6931) {throw new Error('图形库清单不完整。');}
     const receiptPath=this.context.filesDir+'/shader-receipt.json';let previous: Receipt={files:[]};
     if(await fs.access(receiptPath)) {try {previous=JSON.parse(await fs.readText(receiptPath)) as Receipt;} catch (_) {previous={files:[]};}}
     const saved=new Map<string,VerifiedFile>();for(const item of previous.files) {saved.set(item.name,item);}
@@ -189,6 +244,6 @@ export class GameData {
       next.files.push({name:name,bytes:st.size,mtime:st.mtime,sha256:item.sha256});
     }
     await this.saveText(receiptPath,JSON.stringify(next));
-    hilog.info(0,'XblImport','shader library verified count=6927');
+    hilog.info(0,'XblImport','shader library verified count=6931');
   }
 }

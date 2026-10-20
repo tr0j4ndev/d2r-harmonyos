@@ -6,9 +6,9 @@ This is an isolated source import of the existing HarmonyOS experiment, based on
 
 - `runtime/`: maintained HLE C services, ARM64 gates, loader, rewrite tools and earlier offline tests. All 17 current HLE service files are source inputs; they are not regenerated over the maintained versions.
 - `graphics/`: Vulkan/NVN backend including the latest local descriptor changes after historical commit `334f556`. Paths point at the isolated `compat-r32/gfx/` snapshot.
-- `app/`: ArkTS and NAPI source template, version **0.12.0 / 61**, unsigned products, plain development SVG icons. The signed shipping project and game art are not included.
+- `app/`: ArkTS and NAPI source template, version **0.12.0 / 61**, unsigned products, plain development icons. The signed shipping project and game art are not included.
 - `compat-r32/`: only the old NVN interface/layout code and the five existing offline startup patch rules used by this rewriter. These are interface facts, not a copy of the game program. This adds another platform implementation of addresses/interfaces described in `docs/DERIVED.md`; maintainer discussion is still required.
-- `tools/`: prepare external execution images, generate local table inputs, assemble an external unsigned DevEco project.
+- `tools/`: prepare external execution images, generate local table inputs, assemble an external unsigned DevEco project. `tools/device/` holds the on-device build/benchmark/profiling scripts (HAP rebuild, town fps runs, same-session A/B marker toggles, CPU sampling) with their own README.
 
 No original/rewritten game image, original shader, converted game shader, game art, skill table, experience table, save, key, certificate, compiled library or package is included. `gpu_assets.h` and `xbg_clear_spv.h` contain only this project's independently authored synthetic probe/clear shaders; their source/generators are retained. The preset shared-stash byte array was removed; the existing optional include in cloud sync falls back to normal original-game empty-stash behavior.
 

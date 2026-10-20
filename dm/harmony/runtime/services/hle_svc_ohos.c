@@ -68,6 +68,25 @@ static void map_add(uint64_t b, uint64_t n, uint64_t src, uint32_t st) {
 }
 static void map_del(int i) { pthread_mutex_lock(&g_map_lock); g_map[i] = g_map[--g_nmap]; pthread_mutex_unlock(&g_map_lock); }
 
+/* 含 addr 的栈区间：MapMemory 登记的客体栈，否则本 pthread 的宿主栈；都不含则返回 0。
+ * 客体自建线程的栈可能远小于固定清零长度，且 16K 对齐后相邻栈可能共页，越界清零会写到别的线程栈或未映射页。
+ * Stack range containing addr: a guest stack registered by MapMemory, else this pthread's host stack; 0 if neither.
+ * Guest-created stacks can be far smaller than a fixed scrub length, and after 16K rounding neighbouring stacks may
+ * share pages, so scrubbing past the range hits another thread's stack or an unmapped page. */
+int xblr_stack_range(uint64_t addr, uint64_t *base, uint64_t *size) {
+    int found = 0;
+    pthread_mutex_lock(&g_map_lock);
+    for (int i = 0; i < g_nmap; i++)
+        if (g_map[i].state == 0x0B && addr - g_map[i].base < g_map[i].size) { *base = g_map[i].base; *size = g_map[i].size; found = 1; break; }
+    pthread_mutex_unlock(&g_map_lock);
+    if (found) return 1;
+    pthread_attr_t at; void *stack; size_t stack_size;
+    if (pthread_getattr_np(pthread_self(), &at)) return 0;
+    int e = pthread_attr_getstack(&at, &stack, &stack_size); pthread_attr_destroy(&at);
+    if (e || addr - (uintptr_t)stack >= stack_size) return 0;
+    *base = (uintptr_t)stack; *size = stack_size; return 1;
+}
+
 int svc_thread(int num, uint64_t *regs);   // hle_thread.c：线程与同步类
 
 static uint64_t memory_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
@@ -175,7 +194,7 @@ static uint64_t memory_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         uint32_t res = (regs[1] && regs[2] >= 4) ? *(uint32_t *)regs[1] : 0;
         module_t *mm = module_of((void *)regs[30]);
         static int nb;
-        LOG("Break#%d reason=%#llx Result=%#x svc 位于 %s+%#llx", ++nb, regs[0], res, mm ? mm->name : "?", orig_addr);
+        LOG("Break#%d reason=%#llx Result=%#x svc 位于 %#llx lr=%s+%#llx", ++nb, regs[0], res, orig_addr, mm ? mm->name : "?", (unsigned long long)(mm ? regs[30] - (uintptr_t)mm->base : regs[30]));
         sw_backtrace(regs[29]);
         if (regs[0] & 0x80000000ull) return 0;   // 仅通知，可继续
         xblr_execution_stop(XBLR_EXEC_GUEST_BREAK);

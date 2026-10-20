@@ -74,7 +74,17 @@ void crash_watch_frame(void) {atomic_fetch_add(&frames,1);}
 void uimsg_subscribe(void (*fn)(const char*,const char*,const char*)) {if(ui_count>=16)die("UI observer overflow");ui_observers[ui_count++]=fn;}
 void sw_guest_write_prepare(void *p,size_t n) {if(write_prepare)write_prepare(p,n);}
 void sw_guest_write_prep_register(void (*fn)(void*,size_t)) {write_prepare=fn;}
-void sw_backtrace(uint64_t fp) {LOG("guest frame pointer=%#llx",(unsigned long long)fp);}
+void sw_backtrace(uint64_t fp) {
+    LOG("guest frame pointer=%#llx",(unsigned long long)fp);
+    for(int i=0;i<24&&fp&&!(fp&15);++i){
+        uint64_t frame[2];
+        if(!xblr_guest_read(frame,fp,sizeof frame))break;
+        module_t *m=module_of((void*)(uintptr_t)frame[1]);
+        LOG("  #%d fp=%#llx lr=%s+%#llx",i,(unsigned long long)fp,m?m->name:"?",(unsigned long long)(m?frame[1]-(uintptr_t)m->base:frame[1]));
+        if(frame[0]<=fp||frame[0]-fp>(1u<<20))break;
+        fp=frame[0];
+    }
+}
 void hlecount_svc(int n) {(void)n;} /* diagnostic counter: execution report already counts every gate */
 uint64_t svc_host_call(int n,uint64_t *r) {(void)n;(void)r;return 0;} /* no private iOS cuts installed */
 module_t *module_of(const void *p) {uintptr_t a=(uintptr_t)p;for(int i=0;i<g_nmod;++i)if(a>=(uintptr_t)g_mod[i].base&&a-(uintptr_t)g_mod[i].base<g_mod[i].size)return &g_mod[i];return NULL;}
@@ -88,7 +98,13 @@ typedef void *(*xblr_proc_fn)(const void*,const char*);
 static _Atomic(xblr_proc_fn) nvn_proc_original;
 static void *nvn_observe_proc(const char *name,void *p);
 static void *nvn_proc_observed(const void *device,const char *name) {
-    return nvn_observe_proc(name,atomic_load(&nvn_proc_original)(device,name));
+    void *r=atomic_load(&nvn_proc_original)(device,name);
+    /* 解析不到就让游戏拿到 NULL（和 nvnBootstrapLoader 不同，这里不致命）：立刻写 stderr，
+     * 不用环形缓冲——正常解析有几百条会把环挤满，NULL 才是要抓的那一条。
+     * A missing entry point silently yields NULL here (unlike nvnBootstrapLoader): write it to stderr at
+     * once. Normal lookups number in the hundreds and fill any ring buffer; the NULL is the one that matters. */
+    if(!r) dprintf(2,"[xblr-nvn] UNRESOLVED entry point: %s\n", name?name:"(null)");
+    return nvn_observe_proc(name,r);
 }
 static void nvn_present_observed(void *queue,void *window,int index) {
     atomic_load(&nvn_present_original)(queue,window,index);crash_watch_frame();

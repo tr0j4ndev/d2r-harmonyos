@@ -1,1 +1,9 @@
 * text eol=lf
+
+# 二进制资源不做换行转换 | binary assets: no line-ending conversion
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.hap binary
+*.so binary

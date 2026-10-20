@@ -28,3 +28,7 @@
 *.webp
 *.generated.ts
 sw_touch_native_art.c
+
+# 应用图标是仓库自带的资源，不受上面 *.png 排除的影响 | App icons ship with the repo
+!app/AppScope/resources/base/media/*.png
+!app/entry/src/main/resources/base/media/*.png
